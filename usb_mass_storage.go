@@ -128,7 +128,7 @@ func mountImage(imagePath string) error {
 
 var nbdDevice *NBDDevice
 
-const imagesFolder = "/userdata/jetkvm/images"
+const imagesFolder = "/mnt/sdcard"
 
 func initImagesFolder() error {
 	err := os.MkdirAll(imagesFolder, 0755)
