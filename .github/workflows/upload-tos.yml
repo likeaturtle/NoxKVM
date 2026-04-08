@@ -1,0 +1,194 @@
+name: Upload to Volcengine TOS
+
+on:
+  # 支持 workflow_call 供其他 workflow 调用
+  workflow_call:
+    inputs:
+      version:
+        description: 'Release version (e.g., 0.5.6)'
+        required: true
+        type: string
+      artifact_name:
+        description: 'Artifact name to upload'
+        required: true
+        type: string
+        default: 'jetkvm-release'
+    secrets:
+      TOS_ACCESS_KEY:
+        required: true
+      TOS_SECRET_KEY:
+        required: true
+
+  # 支持手动触发
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., 0.5.6)'
+        required: true
+        type: string
+      source:
+        description: 'Download source'
+        required: false
+        type: choice
+        options:
+          - github-release
+          - artifact
+        default: 'github-release'
+      artifact_name:
+        description: 'Artifact name (only used when source=artifact)'
+        required: false
+        type: string
+        default: 'jetkvm-release'
+
+env:
+  TOS_BUCKET: kvm-upgrade
+  TOS_ENDPOINT: tos-cn-guangzhou.volces.com
+  TOS_REGION: cn-guangzhou
+
+jobs:
+  upload-tos:
+    runs-on: ubuntu-latest
+    name: Upload to Volcengine TOS
+    steps:
+      - name: Determine version
+        id: get-version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="${{ inputs.version }}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Using version: $VERSION"
+
+      - name: Download from GitHub Release
+        if: ${{ github.event.inputs.source != 'artifact' && inputs.artifact_name == 'jetkvm-release' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=${{ steps.get-version.outputs.version }}
+          REPO="${{ github.repository }}"
+          
+          echo "Downloading release assets for version ${VERSION}..."
+          
+          # Get release data
+          RELEASE_DATA=$(gh api repos/${REPO}/releases/tags/release/${VERSION} 2>/dev/null || gh api repos/${REPO}/releases/tags/v${VERSION} 2>/dev/null)
+          
+          if [ -z "$RELEASE_DATA" ] || [ "$RELEASE_DATA" = "null" ]; then
+            echo "Error: Release not found for version ${VERSION}"
+            echo "Tried tags: release/${VERSION} and v${VERSION}"
+            exit 1
+          fi
+          
+          # Download assets
+          APP_URL=$(echo "$RELEASE_DATA" | jq -r '.assets[] | select(.name == "jetkvm_app") | .url')
+          SIG_URL=$(echo "$RELEASE_DATA" | jq -r '.assets[] | select(.name == "jetkvm_app.sig") | .url')
+          HASH_URL=$(echo "$RELEASE_DATA" | jq -r '.assets[] | select(.name == "jetkvm_app.sha256") | .url')
+          
+          # Download files
+          curl -sL -H "Authorization: token ${GH_TOKEN}" -H "Accept: application/octet-stream" "${APP_URL}" -o jetkvm_app
+          curl -sL -H "Authorization: token ${GH_TOKEN}" -H "Accept: application/octet-stream" "${SIG_URL}" -o jetkvm_app.sig
+          curl -sL -H "Authorization: token ${GH_TOKEN}" -H "Accept: application/octet-stream" "${HASH_URL}" -o jetkvm_app.sha256
+          
+          echo "✓ Downloaded release assets"
+          ls -la
+
+      - name: Download artifact
+        if: ${{ github.event.inputs.source == 'artifact' || inputs.artifact_name != 'jetkvm-release' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+
+      - name: Setup Volcengine TOS CLI
+        run: |
+          # Download and install tosutil
+          curl -fsSL "https://tos-tools.tos-cn-beijing.volces.com/linux/tosutil" -o tosutil
+          chmod +x tosutil
+          sudo mv tosutil /usr/local/bin/
+          
+          # Verify installation
+          tosutil version
+
+      - name: Upload to TOS version directory
+        env:
+          TOS_ACCESS_KEY: ${{ secrets.TOS_ACCESS_KEY }}
+          TOS_SECRET_KEY: ${{ secrets.TOS_SECRET_KEY }}
+        run: |
+          VERSION=${{ steps.get-version.outputs.version }}
+          
+          # Configure tosutil (note: -re for region, not -r)
+          tosutil config -i "${TOS_ACCESS_KEY}" -k "${TOS_SECRET_KEY}" -e "${TOS_ENDPOINT}" -re "${TOS_REGION}"
+          
+          # Upload files to version directory
+          echo "Uploading to version directory: ${VERSION}/"
+          tosutil cp jetkvm_app "tos://${TOS_BUCKET}/${VERSION}/jetkvm_app"
+          tosutil cp jetkvm_app.sha256 "tos://${TOS_BUCKET}/${VERSION}/jetkvm_app.sha256"
+          tosutil cp jetkvm_app.sig "tos://${TOS_BUCKET}/${VERSION}/jetkvm_app.sig"
+          
+          echo "✓ Uploaded to version directory: ${VERSION}/"
+
+      - name: Upload to TOS latest directory
+        env:
+          TOS_ACCESS_KEY: ${{ secrets.TOS_ACCESS_KEY }}
+          TOS_SECRET_KEY: ${{ secrets.TOS_SECRET_KEY }}
+        run: |
+          VERSION=${{ steps.get-version.outputs.version }}
+          
+          # Upload files to latest directory (overwrite)
+          echo "Uploading to latest directory..."
+          tosutil cp jetkvm_app "tos://${TOS_BUCKET}/latest/jetkvm_app"
+          tosutil cp jetkvm_app.sha256 "tos://${TOS_BUCKET}/latest/jetkvm_app.sha256"
+          tosutil cp jetkvm_app.sig "tos://${TOS_BUCKET}/latest/jetkvm_app.sig"
+          
+          echo "✓ Uploaded to latest directory"
+
+      - name: Generate OTA metadata for TOS
+        env:
+          TOS_ACCESS_KEY: ${{ secrets.TOS_ACCESS_KEY }}
+          TOS_SECRET_KEY: ${{ secrets.TOS_SECRET_KEY }}
+        run: |
+          VERSION=${{ steps.get-version.outputs.version }}
+          BASE_URL="https://${TOS_BUCKET}.${TOS_ENDPOINT}"
+          
+          # Get hash value
+          HASH_VALUE=$(cat jetkvm_app.sha256 | cut -d' ' -f1)
+          
+          # Generate metadata for version directory
+          mkdir -p ./tos-metadata
+          
+          cat > ./tos-metadata/releases << EOF
+          {
+            "appVersion": "${VERSION}",
+            "appUrl": "${BASE_URL}/${VERSION}/jetkvm_app",
+            "appHash": "${HASH_VALUE}",
+            "appSigUrl": "${BASE_URL}/${VERSION}/jetkvm_app.sig",
+            "systemVersion": "0.0.1",
+            "systemUrl": "",
+            "systemHash": ""
+          }
+          EOF
+          
+          # Generate metadata for latest directory
+          cat > ./tos-metadata/latest.json << EOF
+          {
+            "appVersion": "${VERSION}",
+            "appUrl": "${BASE_URL}/latest/jetkvm_app",
+            "appHash": "${HASH_VALUE}",
+            "appSigUrl": "${BASE_URL}/latest/jetkvm_app.sig",
+            "systemVersion": "0.0.1",
+            "systemUrl": "",
+            "systemHash": ""
+          }
+          EOF
+          
+          # Upload metadata files
+          tosutil cp ./tos-metadata/releases "tos://${TOS_BUCKET}/${VERSION}/releases"
+          tosutil cp ./tos-metadata/latest.json "tos://${TOS_BUCKET}/latest/releases"
+          
+          echo "✓ OTA metadata uploaded"
+          echo ""
+          echo "Version metadata:"
+          cat ./tos-metadata/releases
+          echo ""
+          echo "Latest metadata:"
+          cat ./tos-metadata/latest.json
