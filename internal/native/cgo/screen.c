@@ -11,7 +11,7 @@
 #include "ui_index.h"
 #include "ctrl.h"
 
-// #define DISP_BUF_SIZE (300 * 240 * 2)
+// #define DISP_BUF_SIZE (284 * 240 * 2)
 // static lv_color_t buf[DISP_BUF_SIZE];
 
 lv_display_t *disp = NULL;
@@ -31,7 +31,7 @@ void handle_indev_event(lv_event_t *e) {
 }
 
 // The physical LCD panel and touch digitizer are misaligned by ~20 pixels in
-// the Y axis (the 300px dimension). Because LVGL's rotation transform inverts
+// the Y axis (the 284px dimension). Because LVGL's rotation transform inverts
 // the Y-to-X mapping between 90° and 270°, the calibration offset must flip
 // direction with rotation. The evdev calibration remaps the raw touch Y range
 // so that coordinates shift by +TOUCH_Y_OFFSET at 90° and -TOUCH_Y_OFFSET at
@@ -44,15 +44,15 @@ static void apply_touch_calibration(void) {
     if (touch_indev == NULL) return;
 
     if (current_rotation == 90) {
-        // At 90°, physical Y maps to logical X inverted (x = 299 - y).
+        // At 90°, physical Y maps to logical X inverted (x = 283 - y).
         // Shift Y by +TOUCH_Y_OFFSET to align touch with content.
         lv_evdev_set_calibration(touch_indev,
             0, -TOUCH_Y_OFFSET,
-            239, 299 - TOUCH_Y_OFFSET);
+            239, 283 - TOUCH_Y_OFFSET);
         log_info("touch calibration: rotation=%d, Y offset=+%d", current_rotation, TOUCH_Y_OFFSET);
     } else {
         // At 270° (and 0°/180°), no calibration offset needed.
-        lv_evdev_set_calibration(touch_indev, 0, 0, 239, 299);
+        lv_evdev_set_calibration(touch_indev, 0, 0, 239, 283);
         log_info("touch calibration: rotation=%d, no offset", current_rotation);
     }
 }
@@ -84,8 +84,8 @@ void lvgl_init(u_int16_t rotation) {
 
     /*Linux frame buffer device init*/
     disp = lv_linux_fbdev_create();
-    // lv_display_set_physical_resolution(disp, 240, 300);
-    lv_display_set_resolution(disp, 240, 300);
+    // lv_display_set_physical_resolution(disp, 240, 284);
+    lv_display_set_resolution(disp, 240, 284);
     lv_linux_fbdev_set_file(disp, "/dev/fb0");
 
     lvgl_set_rotation(disp, rotation);
