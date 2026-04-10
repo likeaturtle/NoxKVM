@@ -38,6 +38,11 @@ void handle_indev_event(lv_event_t *e) {
 // 270°, keeping touch aligned with visible content at both orientations.
 #define TOUCH_Y_OFFSET 20
 
+// Display offset compensation for ST7789V hardware alignment
+// Positive value shifts display content to the right
+// Adjust this value based on actual hardware alignment
+#define DISPLAY_X_OFFSET 10
+
 static u_int16_t current_rotation = 270;
 
 static void apply_touch_calibration(void) {
@@ -46,14 +51,18 @@ static void apply_touch_calibration(void) {
     if (current_rotation == 90) {
         // At 90°, physical Y maps to logical X inverted (x = 283 - y).
         // Shift Y by +TOUCH_Y_OFFSET to align touch with content.
+        // Note: DISPLAY_X_OFFSET applied via lv_display_set_offset
         lv_evdev_set_calibration(touch_indev,
             0, -TOUCH_Y_OFFSET,
             239, 283 - TOUCH_Y_OFFSET);
         log_info("touch calibration: rotation=%d, Y offset=+%d", current_rotation, TOUCH_Y_OFFSET);
     } else {
-        // At 270° (and 0°/180°), no calibration offset needed.
-        lv_evdev_set_calibration(touch_indev, 0, 0, 239, 283);
-        log_info("touch calibration: rotation=%d, no offset", current_rotation);
+        // At 270° (and 0°/180°), apply X offset for touch alignment.
+        // The touch X range is adjusted to compensate for display offset.
+        lv_evdev_set_calibration(touch_indev, 
+            DISPLAY_X_OFFSET, 0, 
+            239 + DISPLAY_X_OFFSET, 283);
+        log_info("touch calibration: rotation=%d, X offset=%d", current_rotation, DISPLAY_X_OFFSET);
     }
 }
 
@@ -87,6 +96,11 @@ void lvgl_init(u_int16_t rotation) {
     // lv_display_set_physical_resolution(disp, 240, 284);
     lv_display_set_resolution(disp, 240, 284);
     lv_linux_fbdev_set_file(disp, "/dev/fb0");
+    
+    // Compensate for ST7789V hardware column offset (~10 pixels to the right)
+    // Adjust DISPLAY_X_OFFSET value at top of file based on actual hardware
+    lv_display_set_offset(disp, DISPLAY_X_OFFSET, 0);
+    log_info("display offset set to x=%d, y=0", DISPLAY_X_OFFSET);
 
     lvgl_set_rotation(disp, rotation);
 
