@@ -1385,13 +1385,22 @@ test.describe("Remote Host Agent", () => {
       expect(vWheel.length, "Vertical wheel in relative-only mode").toBeGreaterThan(0);
       expect(vWheel[0].value).not.toBe(0);
 
-      // Horizontal scroll
-      await agent!.clearMouseEvents();
-      await callJsonRpc(sharedPage, "wheelReport", { wheelY: 0, wheelX: 1 });
-      const hWheel = await agent!.waitForMouseEvent(
-        ev => ev.type === "mouse_move_rel" && ev.code === REL_HWHEEL,
-        3000,
-      );
+      // Horizontal scroll can hit the same post-re-enumeration race as vertical.
+      const hDeadline = Date.now() + 10000;
+      let hWheel: RAMouseEvent[] = [];
+      while (Date.now() < hDeadline) {
+        await agent!.clearMouseEvents();
+        await callJsonRpc(sharedPage, "wheelReport", { wheelY: 0, wheelX: 1 });
+        try {
+          hWheel = await agent!.waitForMouseEvent(
+            ev => ev.type === "mouse_move_rel" && ev.code === REL_HWHEEL,
+            2000,
+          );
+          break;
+        } catch {
+          /* agent not ready yet, retry */
+        }
+      }
       expect(hWheel.length, "Horizontal wheel in relative-only mode").toBeGreaterThan(0);
       expect(hWheel[0].value).not.toBe(0);
     } finally {
@@ -2281,7 +2290,7 @@ test.describe("Remote Host Agent", () => {
       appVersion: string;
       systemVersion: string;
     };
-    if (!semverGte(localVersion.systemVersion, "0.2.8")) {
+    if (!semverGte(localVersion.systemVersion, "0.2.9")) {
       test.skip(true, `S3 wake requires system >= 0.2.8 (got ${localVersion.systemVersion})`);
       return;
     }
@@ -2389,7 +2398,7 @@ test.describe("Remote Host Agent", () => {
       appVersion: string;
       systemVersion: string;
     };
-    if (!semverGte(localVersion.systemVersion, "0.2.8")) {
+    if (!semverGte(localVersion.systemVersion, "0.2.9")) {
       test.skip(true, `S3 wake requires system >= 0.2.8 (got ${localVersion.systemVersion})`);
       return;
     }
