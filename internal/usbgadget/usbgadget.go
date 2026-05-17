@@ -90,7 +90,6 @@ type UsbGadget struct {
 
 	onKeyboardStateChange *func(state KeyboardState)
 	onKeysDownChange      *func(state KeysDownState)
-	onKeepAliveReset      *func()
 
 	log *zerolog.Logger
 

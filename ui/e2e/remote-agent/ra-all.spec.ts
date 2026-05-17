@@ -12,6 +12,8 @@ import {
   HID_KEY,
   SSH_OPTS,
   callJsonRpc,
+  getKeysDownState,
+  pauseKeepAlive,
   sendKeypress,
   tapKey,
   waitForWebRTCReady,
@@ -633,31 +635,108 @@ test.describe("Remote Host Agent", () => {
   // KEYBOARD: MODIFIER AUTO-RELEASE
   // ═══════════════════════════════════════════
 
-  test("keyboard: modifier keys auto-release after timeout", async () => {
-    test.setTimeout(15_000);
+  test("keyboard: modifiers do not participate in per-key auto-release (10s lone hold)", async () => {
+    test.setTimeout(60_000);
 
     const modifiers = [
-      { hid: 0xe0, linux: KEY.LEFT_CTRL, label: "LeftCtrl" },
-      { hid: 0xe1, linux: KEY.LEFT_SHIFT, label: "LeftShift" },
-      { hid: 0xe2, linux: KEY.LEFT_ALT, label: "LeftAlt" },
+      { hid: 0xe0, linux: KEY.LEFT_CTRL, label: "LeftCtrl", maskBit: 0x01 },
+      { hid: 0xe1, linux: KEY.LEFT_SHIFT, label: "LeftShift", maskBit: 0x02 },
+      { hid: 0xe2, linux: KEY.LEFT_ALT, label: "LeftAlt", maskBit: 0x04 },
     ];
 
-    for (const { hid, linux, label } of modifiers) {
+    for (const { hid, linux, label, maskBit } of modifiers) {
       await agent!.clearKeyboardEvents();
 
-      // Call keypressReport directly via JSON-RPC to bypass the browser's
-      // keepalive timer, which would otherwise extend the auto-release indefinitely.
-      await callJsonRpc(sharedPage, "keypressReport", { key: hid, press: true });
+      await sendKeypress(sharedPage, hid, true);
+
+      const SAMPLES = 20;
+      const SAMPLE_INTERVAL = 500;
+      for (let i = 0; i < SAMPLES; i++) {
+        await new Promise(r => setTimeout(r, SAMPLE_INTERVAL));
+
+        const state = await getKeysDownState(sharedPage);
+        expect(
+          state?.modifier ?? 0,
+          `${label} bit should be set on sample ${i + 1}/${SAMPLES} (t=${(i + 1) * SAMPLE_INTERVAL}ms)`,
+        ).toBe(maskBit);
+
+        const events = await agent!.getKeyboardEvents();
+        const releases = events.filter(ev => ev.code === linux && ev.type === "key_release");
+        expect(releases.length, `${label} must not auto-release (sample ${i + 1}/${SAMPLES})`).toBe(
+          0,
+        );
+      }
+
+      const releaseStart = Date.now();
+      await sendKeypress(sharedPage, hid, false);
+      await new Promise(r => setTimeout(r, 200));
+
+      const finalEvents = await agent!.getKeyboardEvents();
+      const presses = finalEvents.filter(ev => ev.code === linux && ev.type === "key_press");
+      const releases = finalEvents.filter(ev => ev.code === linux && ev.type === "key_release");
+
+      expect(presses.length, `${label} should have exactly 1 press`).toBe(1);
+      expect(releases.length, `${label} should have exactly 1 release`).toBe(1);
+
+      const releaseLatency = releases[0].time_ms - presses[0].time_ms;
+      expect(
+        releaseLatency,
+        `${label} release should occur after the full 10s hold`,
+      ).toBeGreaterThan(SAMPLES * SAMPLE_INTERVAL - 1000);
+      expect(Date.now() - releaseStart).toBeLessThan(2000);
+    }
+  });
+
+  test("keyboard: modifier does not auto-release without browser keepalives", async () => {
+    await agent!.clearKeyboardEvents();
+
+    try {
+      await callJsonRpc(sharedPage, "keypressReport", { key: 0xe1, press: true });
+
+      await expect
+        .poll(
+          async () => {
+            const s = (await callJsonRpc(sharedPage, "getKeyDownState")) as {
+              modifier: number;
+              keys: number[];
+            };
+            return s.modifier === 0x02 && s.keys.every((k: number) => k === 0);
+          },
+          {
+            message: "LeftShift should be held after direct keypressReport",
+            timeout: 5000,
+            intervals: [100, 200, 500],
+          },
+        )
+        .toBe(true);
+
+      await expect
+        .poll(
+          async () => {
+            const events = await agent!.getKeyboardEvents();
+            return events.some(ev => ev.code === KEY.LEFT_SHIFT && ev.type === "key_press");
+          },
+          {
+            message: "Host should see LeftShift press",
+            timeout: 5000,
+            intervals: [100, 200, 500],
+          },
+        )
+        .toBe(true);
+
       await new Promise(r => setTimeout(r, 300));
 
-      const events = await agent!.getKeyboardEvents();
-      const presses = events.filter(ev => ev.code === linux && ev.type === "key_press");
-      const releases = events.filter(ev => ev.code === linux && ev.type === "key_release");
+      const state = (await callJsonRpc(sharedPage, "getKeyDownState")) as {
+        modifier: number;
+        keys: number[];
+      };
+      expect(state.modifier, "LeftShift should still be held without keepalives").toBe(0x02);
 
-      expect(presses.length, `${label} press should be received`).toBeGreaterThanOrEqual(1);
-      expect(releases.length, `${label} should auto-release after timeout`).toBeGreaterThanOrEqual(
-        1,
-      );
+      const events = await agent!.getKeyboardEvents();
+      const releases = events.filter(ev => ev.code === KEY.LEFT_SHIFT && ev.type === "key_release");
+      expect(releases.length, "LeftShift must not auto-release without keepalives").toBe(0);
+    } finally {
+      await callJsonRpc(sharedPage, "keypressReport", { key: 0xe1, press: false }).catch(() => {});
     }
   });
 
@@ -739,6 +818,51 @@ test.describe("Remote Host Agent", () => {
     const focusEvents = await agent!.getKeyboardEvents();
     const stuckPresses = focusEvents.filter(ev => ev.type === "key_press");
     expect(stuckPresses.length, "No stuck keys after re-focus").toBe(0);
+  });
+
+  test("keepalive: window blur clears lone modifier", async () => {
+    await agent!.clearKeyboardEvents();
+
+    await sendKeypress(sharedPage, 0xe1, true);
+    await expect
+      .poll(
+        async () => {
+          const state = await getKeysDownState(sharedPage);
+          return state?.modifier === 0x02;
+        },
+        {
+          message: "LeftShift should be held before blur",
+          timeout: 5000,
+          intervals: [100, 200, 500],
+        },
+      )
+      .toBe(true);
+
+    await sharedPage.evaluate(() => {
+      const target = globalThis as typeof globalThis & {
+        dispatchEvent: (event: Event) => boolean;
+      };
+      target.dispatchEvent(new Event("blur"));
+    });
+
+    await expect
+      .poll(
+        async () => {
+          const state = await getKeysDownState(sharedPage);
+          const events = await agent!.getKeyboardEvents();
+          return (
+            state?.modifier === 0 &&
+            state.keys.every((k: number) => k === 0) &&
+            events.some(ev => ev.code === KEY.LEFT_SHIFT && ev.type === "key_release")
+          );
+        },
+        {
+          message: "Window blur should clear LeftShift",
+          timeout: 5000,
+          intervals: [100, 200, 500],
+        },
+      )
+      .toBe(true);
   });
 
   test("keepalive: arrow key held for 500ms is not prematurely released", async () => {
@@ -1068,62 +1192,295 @@ test.describe("Remote Host Agent", () => {
   });
 
   // ═══════════════════════════════════════════
+  // KEYBOARD: ISSUE #1428 REGRESSION TESTS
+  // ═══════════════════════════════════════════
+
+  test("regression #1428: modifier survives induced keepalive gap mid-chord", async () => {
+    await agent!.clearKeyboardEvents();
+
+    await sendKeypress(sharedPage, 0xe1, true); // Shift down
+    await new Promise(r => setTimeout(r, 80));
+
+    // Exceeds the per-key auto-release deadline but stays below the session
+    // replacement/ICE cleanup paths.
+    await pauseKeepAlive(sharedPage, 250);
+
+    await new Promise(r => setTimeout(r, 50));
+    await sendKeypress(sharedPage, 0x04, true); // A down
+    await new Promise(r => setTimeout(r, 30));
+    await sendKeypress(sharedPage, 0x04, false); // A up
+
+    await new Promise(r => setTimeout(r, 250));
+
+    const events = await agent!.getKeyboardEvents();
+    const shiftPressesPreRelease = events.filter(
+      ev => ev.code === KEY.LEFT_SHIFT && ev.type === "key_press",
+    );
+    const shiftReleasesPreRelease = events.filter(
+      ev => ev.code === KEY.LEFT_SHIFT && ev.type === "key_release",
+    );
+    expect(shiftPressesPreRelease.length, "Shift pressed exactly once").toBe(1);
+    expect(
+      shiftReleasesPreRelease.length,
+      "Shift must NOT have been auto-released during the keepalive gap (#1428)",
+    ).toBe(0);
+
+    const aPresses = events.filter(ev => ev.code === KEY.A && ev.type === "key_press");
+    expect(aPresses.length, "A should have been pressed inside the gap").toBeGreaterThanOrEqual(1);
+    expect(aPresses[0].time_ms).toBeGreaterThan(shiftPressesPreRelease[0].time_ms);
+
+    await sendKeypress(sharedPage, 0xe1, false);
+    await new Promise(r => setTimeout(r, 200));
+
+    const finalEvents = await agent!.getKeyboardEvents();
+    const shiftReleases = finalEvents.filter(
+      ev => ev.code === KEY.LEFT_SHIFT && ev.type === "key_release",
+    );
+    expect(shiftReleases.length, "Shift should have exactly 1 release (the explicit one)").toBe(1);
+  });
+
+  test("regression #1428: auto-released key under modifier does not poison next chord", async () => {
+    test.setTimeout(15_000);
+    await agent!.clearKeyboardEvents();
+
+    await sendKeypress(sharedPage, 0xe1, true); // Shift down
+    await new Promise(r => setTimeout(r, 80));
+    await sendKeypress(sharedPage, 0x04, true); // A down
+    await new Promise(r => setTimeout(r, 80));
+    await pauseKeepAlive(sharedPage, 5000);
+    await new Promise(r => setTimeout(r, 300));
+
+    await expect
+      .poll(
+        async () => {
+          const state = await getKeysDownState(sharedPage);
+          return state?.modifier === 0x02 && state.keys.every((k: number) => k === 0);
+        },
+        {
+          message: "A should auto-release while LeftShift remains held",
+          timeout: 5000,
+          intervals: [100, 200, 500],
+        },
+      )
+      .toBe(true);
+
+    await new Promise(r => setTimeout(r, 3000));
+
+    await agent!.clearKeyboardEvents();
+    const bPressStart = Date.now();
+    await sendKeypress(sharedPage, 0x05, true); // B down
+
+    for (const t of [50, 150, 300, 450]) {
+      await new Promise(r => setTimeout(r, Math.max(0, t - (Date.now() - bPressStart))));
+      const state = await getKeysDownState(sharedPage);
+      expect(
+        state?.modifier === 0x02 && state.keys.includes(0x05),
+        `B should still be held with LeftShift at t+${t}ms`,
+      ).toBe(true);
+    }
+
+    await sendKeypress(sharedPage, 0x05, false);
+    await sendKeypress(sharedPage, 0x04, false);
+    await sendKeypress(sharedPage, 0xe1, false);
+    await new Promise(r => setTimeout(r, 200));
+
+    const events = await agent!.getKeyboardEvents();
+    const bPresses = events.filter(ev => ev.code === KEY.B && ev.type === "key_press");
+    const bReleases = events.filter(ev => ev.code === KEY.B && ev.type === "key_release");
+    const shiftReleases = events.filter(
+      ev => ev.code === KEY.LEFT_SHIFT && ev.type === "key_release",
+    );
+
+    expect(bPresses.length, "B pressed exactly once").toBe(1);
+    expect(bReleases.length, "B should have exactly one release").toBe(1);
+    expect(shiftReleases.length, "LeftShift should release only explicitly").toBe(1);
+
+    const holdDuration = bReleases[0].time_ms - bPresses[0].time_ms;
+    expect(
+      holdDuration,
+      "B should not auto-release at ~100ms under LeftShift",
+    ).toBeGreaterThanOrEqual(400);
+  });
+
+  test("regression #1428: lone-modifier hold does not poison next hold's auto-release", async () => {
+    test.setTimeout(15_000);
+    await agent!.clearKeyboardEvents();
+
+    await sendKeypress(sharedPage, 0xe1, true);
+    await new Promise(r => setTimeout(r, 1000));
+    await sendKeypress(sharedPage, 0xe1, false);
+
+    await new Promise(r => setTimeout(r, 3000));
+
+    await agent!.clearKeyboardEvents();
+    const aPressStart = Date.now();
+    await sendKeypress(sharedPage, 0x04, true);
+
+    for (const t of [50, 150, 300, 450]) {
+      await new Promise(r => setTimeout(r, t - (Date.now() - aPressStart)));
+      const state = await getKeysDownState(sharedPage);
+      expect(
+        state?.keys?.includes(0x04) ?? false,
+        `'a' should still be held in keysDownState at t+${t}ms (cross-hold reset working)`,
+      ).toBe(true);
+    }
+
+    await sendKeypress(sharedPage, 0x04, false);
+    await new Promise(r => setTimeout(r, 200));
+
+    const events = await agent!.getKeyboardEvents();
+    const aPresses = events.filter(ev => ev.code === KEY.A && ev.type === "key_press");
+    const aReleases = events.filter(ev => ev.code === KEY.A && ev.type === "key_release");
+    expect(aPresses.length, "A pressed exactly once").toBe(1);
+    expect(aReleases.length, "A should have exactly one release (no premature auto-release)").toBe(
+      1,
+    );
+
+    const holdDuration = aReleases[0].time_ms - aPresses[0].time_ms;
+    expect(
+      holdDuration,
+      "A should be held for ~500ms — premature release at ~100ms means cross-hold reset is broken",
+    ).toBeGreaterThanOrEqual(400);
+  });
+
+  test("regression #1428: auto-released key does not poison next hold's auto-release", async () => {
+    test.setTimeout(15_000);
+    await agent!.clearKeyboardEvents();
+
+    await sendKeypress(sharedPage, 0x04, true);
+    await new Promise(r => setTimeout(r, 80));
+    await pauseKeepAlive(sharedPage, 5000);
+    await new Promise(r => setTimeout(r, 300));
+
+    await expect
+      .poll(
+        async () => {
+          const state = await getKeysDownState(sharedPage);
+          return state?.modifier === 0 && state.keys.every((k: number) => k === 0);
+        },
+        {
+          message: "A should auto-release to an empty device state",
+          timeout: 5000,
+          intervals: [100, 200, 500],
+        },
+      )
+      .toBe(true);
+
+    await new Promise(r => setTimeout(r, 3000));
+
+    await agent!.clearKeyboardEvents();
+    const bPressStart = Date.now();
+    await sendKeypress(sharedPage, 0x05, true);
+
+    // Keepalive timing must reset when auto-release empties the keyboard state.
+    for (const t of [50, 150, 300, 450]) {
+      await new Promise(r => setTimeout(r, Math.max(0, t - (Date.now() - bPressStart))));
+      const state = await getKeysDownState(sharedPage);
+      expect(
+        state?.keys?.includes(0x05) ?? false,
+        `B should still be held in keysDownState at t+${t}ms after auto-release reset`,
+      ).toBe(true);
+    }
+
+    await sendKeypress(sharedPage, 0x05, false);
+    await sendKeypress(sharedPage, 0x04, false);
+    await new Promise(r => setTimeout(r, 200));
+
+    const events = await agent!.getKeyboardEvents();
+    const bPresses = events.filter(ev => ev.code === KEY.B && ev.type === "key_press");
+    const bReleases = events.filter(ev => ev.code === KEY.B && ev.type === "key_release");
+    expect(bPresses.length, "B pressed exactly once").toBe(1);
+    expect(bReleases.length, "B should have exactly one release").toBe(1);
+
+    const holdDuration = bReleases[0].time_ms - bPresses[0].time_ms;
+    expect(
+      holdDuration,
+      "B should be held for ~500ms, not auto-release at ~100ms from stale jitter state",
+    ).toBeGreaterThanOrEqual(400);
+  });
+
+  // ═══════════════════════════════════════════
   // KEYBOARD: KEYS RELEASED ON DISCONNECT
   // ═══════════════════════════════════════════
 
   test("keyboard: all keys released when WebRTC session disconnects", async ({ browser }) => {
     test.setTimeout(30_000);
 
-    // Opening a new page takes over currentSession (single-session device),
-    // kicking sharedPage. We'll reconnect sharedPage at the end.
     const freshPage = await browser.newPage();
     await freshPage.goto("/", { waitUntil: "networkidle" });
     await waitForWebRTCReady(freshPage);
 
     await agent!.clearKeyboardEvents();
 
-    // Hold down a modifier (LeftShift) and a regular key (Space) without releasing
     await sendKeypress(freshPage, 0xe1, true);
     await new Promise(r => setTimeout(r, 20));
     await sendKeypress(freshPage, HID_KEY.SPACE, true);
-    await new Promise(r => setTimeout(r, 50));
 
-    // Verify the host received the presses before we disconnect
-    const preEvents = await agent!.getKeyboardEvents();
-    const shiftPresses = preEvents.filter(
-      ev => ev.code === KEY.LEFT_SHIFT && ev.type === "key_press",
-    );
-    expect(shiftPresses.length, "Host should see LeftShift press").toBeGreaterThanOrEqual(1);
+    await expect
+      .poll(
+        async () => {
+          const state = await getKeysDownState(freshPage);
+          return state?.modifier === 0x02 && state.keys.includes(HID_KEY.SPACE);
+        },
+        {
+          message: "LeftShift and Space should be held before disconnect",
+          timeout: 5000,
+          intervals: [100, 200, 500],
+        },
+      )
+      .toBe(true);
 
-    // Close the page to sever the WebRTC session, triggering the all-keys-up report
+    await expect
+      .poll(
+        async () => {
+          const events = await agent!.getKeyboardEvents();
+          return (
+            events.some(ev => ev.code === KEY.LEFT_SHIFT && ev.type === "key_press") &&
+            events.some(ev => ev.code === KEY.SPACE && ev.type === "key_press")
+          );
+        },
+        {
+          message: "Host should see LeftShift and Space presses",
+          timeout: 5000,
+          intervals: [100, 200, 500],
+        },
+      )
+      .toBe(true);
+
+    // Close the peer directly so browser blur/page-unload cleanup cannot satisfy the test.
+    await freshPage.evaluate(() => {
+      const peerConnection = (
+        globalThis as typeof globalThis & {
+          __kvmTestHooks?: { _getPeerConnection?: () => { close: () => void } | null };
+        }
+      ).__kvmTestHooks?._getPeerConnection?.();
+      if (!peerConnection) throw new Error("Peer connection not available");
+      peerConnection.close();
+    });
+
+    await expect
+      .poll(
+        async () => {
+          const events = await agent!.getKeyboardEvents();
+          return (
+            events.some(ev => ev.code === KEY.LEFT_SHIFT && ev.type === "key_release") &&
+            events.some(ev => ev.code === KEY.SPACE && ev.type === "key_release")
+          );
+        },
+        {
+          message: "Host should see LeftShift and Space releases after disconnect",
+          timeout: 5000,
+          intervals: [100, 200, 500],
+        },
+      )
+      .toBe(true);
+
     await freshPage.close();
-    await new Promise(r => setTimeout(r, 1000));
 
-    // Verify the host received releases for both keys
-    const allEvents = await agent!.getKeyboardEvents();
-    const shiftReleases = allEvents.filter(
-      ev => ev.code === KEY.LEFT_SHIFT && ev.type === "key_release",
-    );
-    const spaceReleases = allEvents.filter(
-      ev => ev.code === KEY.SPACE && ev.type === "key_release",
-    );
-
-    expect(
-      shiftReleases.length,
-      "Host should see LeftShift release after disconnect",
-    ).toBeGreaterThanOrEqual(1);
-    expect(
-      spaceReleases.length,
-      "Host should see Space release after disconnect",
-    ).toBeGreaterThanOrEqual(1);
-
-    // Reconnect sharedPage so subsequent tests can use it
     await sharedPage.goto("/", { waitUntil: "networkidle" });
     await waitForWebRTCReady(sharedPage);
     await waitForRpcReady(sharedPage);
 
-    // Verify device-side keys-down state is clear by querying the device
-    // directly via JSON-RPC (bypasses Zustand store / hidRpc timing)
     await expect
       .poll(
         async () => {
@@ -1140,6 +1497,87 @@ test.describe("Remote Host Agent", () => {
         },
       )
       .toBe(true);
+  });
+
+  test("keyboard: held modifier released when WebRTC session is replaced", async ({ browser }) => {
+    test.setTimeout(30_000);
+
+    const oldPage = await browser.newPage();
+    let replacementPage: Page | null = null;
+
+    try {
+      await oldPage.goto("/", { waitUntil: "networkidle" });
+      await waitForWebRTCReady(oldPage);
+      await waitForRpcReady(oldPage);
+
+      await agent!.clearKeyboardEvents();
+      await callJsonRpc(oldPage, "keypressReport", { key: 0xe1, press: true });
+
+      await expect
+        .poll(
+          async () => {
+            const s = (await callJsonRpc(oldPage, "getKeyDownState")) as {
+              modifier: number;
+              keys: number[];
+            };
+            return s.modifier === 0x02 && s.keys.every((k: number) => k === 0);
+          },
+          {
+            message: "Old session should hold LeftShift before replacement",
+            timeout: 5000,
+            intervals: [100, 200, 500],
+          },
+        )
+        .toBe(true);
+
+      replacementPage = await browser.newPage();
+      await replacementPage.goto("/", { waitUntil: "networkidle" });
+      await waitForWebRTCReady(replacementPage);
+      await waitForRpcReady(replacementPage);
+
+      await expect
+        .poll(
+          async () => {
+            const events = await agent!.getKeyboardEvents();
+            return events.some(ev => ev.code === KEY.LEFT_SHIFT && ev.type === "key_release");
+          },
+          {
+            message: "Replacing the session should release LeftShift",
+            timeout: 5000,
+            intervals: [200, 500],
+          },
+        )
+        .toBe(true);
+
+      await expect
+        .poll(
+          async () => {
+            const s = (await callJsonRpc(replacementPage!, "getKeyDownState")) as {
+              modifier: number;
+              keys: number[];
+            };
+            return s.modifier === 0 && s.keys.every((k: number) => k === 0);
+          },
+          {
+            message: "Keyboard state should be clear after session replacement",
+            timeout: 5000,
+            intervals: [200, 500],
+          },
+        )
+        .toBe(true);
+    } finally {
+      if (replacementPage) {
+        await callJsonRpc(replacementPage, "keypressReport", { key: 0xe1, press: false }).catch(
+          () => {},
+        );
+        await replacementPage.close().catch(() => {});
+      }
+      await oldPage.close().catch(() => {});
+
+      await sharedPage.goto("/", { waitUntil: "networkidle" });
+      await waitForWebRTCReady(sharedPage);
+      await waitForRpcReady(sharedPage);
+    }
   });
 
   // ═══════════════════════════════════════════
@@ -1645,9 +2083,7 @@ test.describe("Remote Host Agent", () => {
     }
 
     // Verify keyboard works before test
-    const preEvents = await agent!.expectKeyPress(KEY.SPACE, async () => {
-      await tapKey(sharedPage, HID_KEY.SPACE);
-    });
+    const preEvents = await waitForKeyboardReady(agent!, sharedPage);
     expect(preEvents.length, "keyboard should work before EBUSY test").toBeGreaterThan(0);
 
     // Mount ISO as CDROM
@@ -2290,7 +2726,7 @@ test.describe("Remote Host Agent", () => {
       appVersion: string;
       systemVersion: string;
     };
-    if (!semverGte(localVersion.systemVersion, "0.2.9")) {
+    if (!semverGte(localVersion.systemVersion, "0.2.8")) {
       test.skip(true, `S3 wake requires system >= 0.2.8 (got ${localVersion.systemVersion})`);
       return;
     }
@@ -2398,7 +2834,7 @@ test.describe("Remote Host Agent", () => {
       appVersion: string;
       systemVersion: string;
     };
-    if (!semverGte(localVersion.systemVersion, "0.2.9")) {
+    if (!semverGte(localVersion.systemVersion, "0.2.8")) {
       test.skip(true, `S3 wake requires system >= 0.2.8 (got ${localVersion.systemVersion})`);
       return;
     }

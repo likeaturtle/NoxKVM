@@ -80,6 +80,17 @@ export async function sendKeypress(page: Page, keyCode: number, press: boolean):
   );
 }
 
+/**
+ * Temporarily pause browser keypress keepalives while preserving held keys.
+ */
+export async function pauseKeepAlive(page: Page, ms: number): Promise<void> {
+  await page.evaluate(durationMs => {
+    const hooks = window.__kvmTestHooks;
+    if (!hooks) throw new Error("Test hooks not available");
+    hooks.pauseKeepAlive(durationMs);
+  }, ms);
+}
+
 export async function tapKey(page: Page, keyCode: number, holdMs = 20): Promise<void> {
   await sendKeypress(page, keyCode, true);
   await page.waitForTimeout(holdMs);

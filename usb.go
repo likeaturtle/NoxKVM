@@ -37,11 +37,6 @@ func initUsbGadget() {
 	gadget.SetOnKeysDownChange(func(state usbgadget.KeysDownState) {
 		if currentSession != nil {
 			currentSession.enqueueKeysDownState(state)
-		}
-	})
-
-	gadget.SetOnKeepAliveReset(func() {
-		if currentSession != nil {
 			currentSession.resetKeepAliveTime()
 		}
 	})

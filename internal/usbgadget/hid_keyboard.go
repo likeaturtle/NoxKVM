@@ -157,10 +157,6 @@ func (u *UsbGadget) SetOnKeysDownChange(f func(state KeysDownState)) {
 	u.onKeysDownChange = &f
 }
 
-func (u *UsbGadget) SetOnKeepAliveReset(f func()) {
-	u.onKeepAliveReset = &f
-}
-
 // DefaultAutoReleaseDuration is the default duration for auto-release of a key.
 const DefaultAutoReleaseDuration = 100 * time.Millisecond
 
@@ -188,11 +184,6 @@ func (u *UsbGadget) cancelAutoRelease(key byte) {
 		timer.Stop()
 		u.kbdAutoReleaseTimers[key] = nil
 		delete(u.kbdAutoReleaseTimers, key)
-
-		// Reset keep-alive timing when key is released
-		if u.onKeepAliveReset != nil {
-			(*u.onKeepAliveReset)()
-		}
 	}
 }
 
@@ -239,21 +230,13 @@ func (u *UsbGadget) performAutoRelease(key byte) {
 	delete(u.kbdAutoReleaseTimers, key)
 	u.kbdAutoReleaseLock.Unlock()
 
-	// Skip if already released
+	// Timers are only scheduled for non-modifier keys.
 	state := u.GetKeysDownState()
 	alreadyReleased := true
-
-	if mask, exists := KeyCodeToMaskMap[key]; exists {
-		// Modifier keys are tracked in state.Modifier bitmask, not in state.Keys
-		if state.Modifier&mask != 0 {
+	for i := range state.Keys {
+		if state.Keys[i] == key {
 			alreadyReleased = false
-		}
-	} else {
-		for i := range state.Keys {
-			if state.Keys[i] == key {
-				alreadyReleased = false
-				break
-			}
+			break
 		}
 	}
 
@@ -598,14 +581,19 @@ func (u *UsbGadget) KeypressReport(key byte, press bool) error {
 	if err != nil && !IsHIDTemporarilyUnavailableError(err) {
 		u.log.Warn().Uint8("key", key).Bool("press", press).Msg("failed to report key")
 	}
-	isRolledOver := state.Keys[0] == hidErrorRollOver
 
-	if isRolledOver {
-		u.cancelAutoRelease(key)
-	} else if press {
-		u.scheduleAutoRelease(key)
-	} else {
-		u.cancelAutoRelease(key)
+	isRolledOver := state.Keys[0] == hidErrorRollOver
+	_, isModifier := KeyCodeToMaskMap[key]
+
+	// Modifiers are tracked separately from the key buffer and must only be
+	// released by explicit state clears or matching key-up reports.
+	if !isModifier {
+		switch {
+		case isRolledOver, !press:
+			u.cancelAutoRelease(key)
+		default:
+			u.scheduleAutoRelease(key)
+		}
 	}
 
 	return err

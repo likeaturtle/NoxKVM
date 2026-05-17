@@ -13,6 +13,7 @@ import { KeyboardLedState, KeysDownState } from "@/hooks/stores";
 /** Internal handlers set by React components (prefixed with _ to indicate internal use) */
 interface TestHooksInternal {
   _handleKeyPress?: (key: number, press: boolean) => void;
+  _pauseKeepAlive?: (ms: number) => void;
   _handleAbsMouseMove?: (x: number, y: number, buttons: number) => void;
   _getKeyboardLedState?: () => KeyboardLedState;
   _getKeysDownState?: () => KeysDownState;
@@ -30,6 +31,10 @@ export interface KvmTestHooks extends TestHooksInternal {
   getKeyboardLedState: () => KeyboardLedState | null;
   getKeysDownState: () => KeysDownState | null;
   sendKeypress: (key: number, press: boolean) => void;
+  /**
+   * Test-only: pause keypress keepalives while preserving held keys.
+   */
+  pauseKeepAlive: (ms: number) => void;
   sendAbsMouseMove: (x: number, y: number, buttons: number) => void;
   sendJsonRpc: (
     method: string,
@@ -94,6 +99,14 @@ export function initTestHooks(): void {
         hooks._handleKeyPress(key, press);
       } else {
         console.warn("[E2E] sendKeypress called but no handler registered");
+      }
+    },
+
+    pauseKeepAlive: (ms: number) => {
+      if (hooks._pauseKeepAlive) {
+        hooks._pauseKeepAlive(ms);
+      } else {
+        console.warn("[E2E] pauseKeepAlive called but no handler registered");
       }
     },
 
@@ -321,6 +334,7 @@ export function initTestHooks(): void {
  */
 export function registerTestHandlers(handlers: {
   handleKeyPress: (key: number, press: boolean) => void;
+  pauseKeepAlive: (ms: number) => void;
   handleAbsMouseMove: (x: number, y: number, buttons: number) => void;
   getKeyboardLedState: () => KeyboardLedState;
   getKeysDownState: () => KeysDownState;
@@ -336,6 +350,7 @@ export function registerTestHandlers(handlers: {
   if (!window.__kvmTestHooks) return;
 
   window.__kvmTestHooks._handleKeyPress = handlers.handleKeyPress;
+  window.__kvmTestHooks._pauseKeepAlive = handlers.pauseKeepAlive;
   window.__kvmTestHooks._handleAbsMouseMove = handlers.handleAbsMouseMove;
   window.__kvmTestHooks._getKeyboardLedState = handlers.getKeyboardLedState;
   window.__kvmTestHooks._getKeysDownState = handlers.getKeysDownState;
@@ -356,6 +371,7 @@ export function cleanupTestHooks(): void {
   if (!window.__kvmTestHooks) return;
 
   window.__kvmTestHooks._handleKeyPress = undefined;
+  window.__kvmTestHooks._pauseKeepAlive = undefined;
   window.__kvmTestHooks._handleAbsMouseMove = undefined;
   window.__kvmTestHooks._getKeyboardLedState = undefined;
   window.__kvmTestHooks._getKeysDownState = undefined;

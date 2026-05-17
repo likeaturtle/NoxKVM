@@ -138,6 +138,19 @@ export default function useKeyboard() {
     }, KEEPALIVE_INTERVAL);
   }, [cancelKeepAlive]);
 
+  // Test hook: pause keepalives while preserving the held-key set.
+  const pauseKeepAlive = useCallback(
+    (ms: number) => {
+      cancelKeepAlive();
+      window.setTimeout(() => {
+        if (heldKeysRef.current.size > 0) {
+          scheduleKeepAlive();
+        }
+      }, ms);
+    },
+    [cancelKeepAlive, scheduleKeepAlive],
+  );
+
   // resetKeyboardState is used to reset the keyboard state to no keys pressed and no modifiers.
   // This is useful for macros, in case of client-side rollover, and when the browser loses focus
   const resetKeyboardState = useCallback(async () => {
@@ -400,5 +413,6 @@ export default function useKeyboard() {
     executeMacro,
     cleanup,
     cancelExecuteMacro,
+    pauseKeepAlive,
   };
 }
