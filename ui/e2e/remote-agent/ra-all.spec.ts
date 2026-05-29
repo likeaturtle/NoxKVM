@@ -28,6 +28,7 @@ import {
 } from "../helpers";
 import {
   createRemoteAgent,
+  connectedDisplayConnectors,
   KEY,
   HID_TO_LINUX,
   type RemoteAgent,
@@ -137,6 +138,201 @@ function remoteHostSetDPMS(off: boolean): void {
       `--object-path /org/gnome/ScreenSaver ` +
       `--method org.gnome.ScreenSaver.SetActive ${off ? "true" : "false"}`,
   );
+}
+
+function remoteHostSupportsS3(): { supported: boolean; reason?: string } {
+  let memSleep: string;
+  try {
+    memSleep = remoteHostExec("cat /sys/power/mem_sleep").trim();
+  } catch {
+    return { supported: false, reason: "Cannot read /sys/power/mem_sleep on remote host" };
+  }
+
+  if (!memSleep.includes("deep") && !memSleep.includes("[mem]")) {
+    return { supported: false, reason: `S3 deep sleep not available (mem_sleep: ${memSleep})` };
+  }
+
+  return { supported: true };
+}
+
+function enableRemoteHostUSBWake(options: { includeRootHub?: boolean } = {}): void {
+  // Keep parent/root hub wake disabled by default so the tests exercise the
+  // JetKVM wake-capable HID function instead of generic USB bus activity.
+  const enableParentHub = options.includeRootHub
+    ? 'p=$(dirname "$(readlink -f "$d")")/power/wakeup; [ -f "$p" ] && echo enabled | sudo tee "$p" > /dev/null; '
+    : "";
+
+  remoteHostExec(
+    "found=0; " +
+      "for d in /sys/bus/usb/devices/*/; do " +
+      '[ -f "$d/power/wakeup" ] && echo disabled | sudo tee "$d/power/wakeup" > /dev/null || true; ' +
+      "done; " +
+      "for d in /sys/bus/usb/devices/*/; do " +
+      'if [ -f "$d/power/wakeup" ] && cat "$d/product" "$d/manufacturer" 2>/dev/null | grep -q JetKVM; then ' +
+      'echo enabled | sudo tee "$d/power/wakeup" > /dev/null; ' +
+      enableParentHub +
+      "found=1; " +
+      "fi; done; " +
+      '[ "$found" -eq 1 ]',
+  );
+}
+
+function suspendRemoteHost(options: { wakeAfterSeconds?: number } = {}): void {
+  const suspendCommand = options.wakeAfterSeconds
+    ? `sleep 0.5 && rtcwake -m mem -s ${options.wakeAfterSeconds}`
+    : "sleep 0.5 && echo mem > /sys/power/state";
+
+  remoteHostExec(`sudo sh -c 'nohup sh -c "${suspendCommand}" >/dev/null 2>&1 &'`, 5000);
+}
+
+async function waitForHostAsleep(timeoutMs = 15000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!(await agent!.health())) {
+      return;
+    }
+    await new Promise(r => setTimeout(r, 1000));
+  }
+
+  throw new Error(`Host did not enter sleep within ${timeoutMs}ms`);
+}
+
+async function waitForHostAwake(timeoutMs = 60000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await agent!.health()) {
+      return;
+    }
+    await new Promise(r => setTimeout(r, 1000));
+  }
+
+  throw new Error(`Host did not wake within ${timeoutMs}ms`);
+}
+
+async function expectHostStaysAsleep(durationMs: number, intervalMs = 2000): Promise<void> {
+  const deadline = Date.now() + durationMs;
+  while (Date.now() < deadline) {
+    expect(await agent!.health(), "Host woke while it should have stayed asleep").toBe(false);
+    await new Promise(r => setTimeout(r, intervalMs));
+  }
+}
+
+async function waitForNoSignalOverlay(page: Page, timeoutMs = 20000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const videoState = (await callJsonRpc(page, "getVideoState")) as { error?: string };
+      if (videoState.error === "no_signal") {
+        return;
+      }
+    } catch {
+      /* WebRTC may still be settling after host suspend */
+    }
+    await new Promise(r => setTimeout(r, 1000));
+  }
+
+  throw new Error(`Video state did not become no_signal within ${timeoutMs}ms`);
+}
+
+async function putRemoteHostToSleepForUSBWakeTest(
+  page: Page,
+  options: { includeRootHubWake?: boolean; wakeAfterSeconds?: number } = {},
+): Promise<void> {
+  const s3 = remoteHostSupportsS3();
+  test.skip(!s3.supported, s3.reason ?? "S3 sleep not supported");
+
+  if (options.wakeAfterSeconds) {
+    try {
+      remoteHostExec("command -v rtcwake >/dev/null");
+    } catch {
+      test.skip(true, "rtcwake is not available on remote host");
+    }
+  }
+
+  const localVersion = (await callJsonRpc(page, "getLocalVersion")) as {
+    appVersion: string;
+    systemVersion: string;
+  };
+  test.skip(
+    !semverGte(localVersion.systemVersion, "0.2.8"),
+    `S3 wake requires system >= 0.2.8 (got ${localVersion.systemVersion})`,
+  );
+
+  enableRemoteHostUSBWake({ includeRootHub: options.includeRootHubWake });
+  await waitForVideoDimensions(page, 10000);
+  expect(await agent!.health()).toBe(true);
+
+  let suspendScheduled = false;
+  try {
+    try {
+      suspendRemoteHost({ wakeAfterSeconds: options.wakeAfterSeconds });
+      suspendScheduled = true;
+    } catch {
+      /* SSH may drop during suspend, that's expected */
+      suspendScheduled = true;
+    }
+
+    await waitForHostAsleep();
+    await waitForNoSignalOverlay(page);
+  } catch (error) {
+    if (suspendScheduled && options.wakeAfterSeconds) {
+      await recoverRemoteHostAfterUSBWakeTest(page, options.wakeAfterSeconds * 1000 + 30000);
+    }
+    throw error;
+  }
+}
+
+async function recoverRemoteHostAfterUSBWakeTest(page: Page, timeoutMs = 120000): Promise<void> {
+  await waitForHostAwake(timeoutMs);
+  await page.goto("/", { waitUntil: "networkidle" });
+  await waitForWebRTCReady(page);
+  await waitForRpcReady(page);
+  await waitForVideoDimensions(page, 30000);
+}
+
+async function wakeRemoteHostWithWakeButton(page: Page, timeoutMs = 45000): Promise<void> {
+  await waitForNoSignalOverlay(page);
+  const wakeButton = page.getByRole("button", { name: /^try to wake$/i }).first();
+  await expect(wakeButton).toBeVisible({ timeout: 10000 });
+  await wakeButton.click();
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await agent!.health()) {
+      return;
+    }
+    await new Promise(r => setTimeout(r, 1000));
+  }
+
+  throw new Error(`Host did not wake within ${timeoutMs}ms after clicking Try to wake`);
+}
+
+async function sendBrowserInputThatMustNotWakeHost(page: Page): Promise<void> {
+  await page.bringToFront();
+  await page.locator("body").click({ position: { x: 10, y: 10 }, force: true });
+
+  const video = page.locator("video").first();
+  const box = await video.boundingBox();
+  const videoX = box ? box.x + Math.max(12, box.width * 0.12) : 40;
+  const videoY = box ? box.y + Math.max(12, box.height * 0.12) : 40;
+
+  for (let i = 0; i < 8; i++) {
+    await page.mouse.move(videoX + i * 7, videoY + i * 5);
+    await page.mouse.down();
+    await page.mouse.up();
+    await page.mouse.wheel(i % 2 === 0 ? 120 : -120, i % 2 === 0 ? 0 : 120);
+    await page.keyboard.press("Space");
+    await page.keyboard.press("KeyA");
+    await page.keyboard.press("Escape");
+
+    await page.evaluate(() => {
+      window.dispatchEvent(new Event("blur"));
+      document.dispatchEvent(new Event("visibilitychange"));
+      window.dispatchEvent(new Event("focus"));
+    });
+
+    await new Promise(r => setTimeout(r, 500));
+  }
 }
 
 const agent = createRemoteAgent();
@@ -261,6 +457,43 @@ async function waitForUdcState(expected: string, timeoutMs: number): Promise<voi
   throw new Error(
     `Timed out waiting for UDC state "${expected}" within ${timeoutMs}ms (last seen: "${lastSeen}")`,
   );
+}
+
+function isJsonRpcTimeout(err: unknown, method: string): boolean {
+  return err instanceof Error && err.message.includes(`RPC timeout for ${method}`);
+}
+
+async function sendUsbReconfigRpc(
+  method: "setUsbDevices" | "setUsbConfig",
+  params: Record<string, unknown>,
+): Promise<void> {
+  try {
+    await callJsonRpc(sharedPage, method, params);
+  } catch (err) {
+    if (!isJsonRpcTimeout(err, method)) throw err;
+  }
+}
+
+async function setUsbDevicesAndWait(
+  devices: typeof USB_DEVICES_DEFAULT,
+  expectedTypes: string[],
+  timeoutMs = 45_000,
+) {
+  // A gadget rebind can finish after the browser-side JSON-RPC test hook times
+  // out, especially after virtual-media EBUSY cleanup has left the host xHCI
+  // stack re-enumerating. Treat that timeout as command accepted, then poll the
+  // host-visible input devices for the state that actually matters.
+  await sendUsbReconfigRpc("setUsbDevices", { devices });
+  return agent!.waitForInputDevices(expectedTypes, timeoutMs);
+}
+
+async function setUsbConfigAndWait(
+  usbConfig: typeof USB_DEFAULT_CONFIG,
+  expectedId: string,
+  timeoutMs = 45_000,
+) {
+  await sendUsbReconfigRpc("setUsbConfig", { usbConfig });
+  return agent!.waitForUSBDevice(d => d.id === expectedId, true, timeoutMs);
 }
 
 // Pre-built key list for batched keyboard scan test
@@ -429,6 +662,24 @@ test.afterAll(async () => {
   if (sharedPage) await sharedPage.close();
 });
 
+// Snapshot /userdata/jetkvm/last.log into the failing test's output dir before
+// any subsequent test reboots the device (RkLunch's `> last.log` at boot wipes
+// the log, and /oem is read-only so we can't change that). This makes the
+// capture race-free regardless of what later tests do.
+// Empty fixture destructure is required by Playwright; `_` would fail the
+// runtime "destructuring pattern" check.
+// oxlint-disable-next-line no-empty-pattern
+test.afterEach(async ({}, testInfo) => {
+  if (!agent) return;
+  if (testInfo.status === testInfo.expectedStatus) return;
+  const log = await sshExec("cat /userdata/jetkvm/last.log", true);
+  try {
+    await testInfo.attach("device-last.log", { body: log, contentType: "text/plain" });
+  } catch {
+    // attach can throw if the worker is already tearing down; sshExec(_, true) won't.
+  }
+});
+
 test.describe("Remote Host Agent", () => {
   // ═══════════════════════════════════════════
   // KEYBOARD: TOGGLE KEYS + LED ROUND-TRIP
@@ -515,6 +766,86 @@ test.describe("Remote Host Agent", () => {
   // ═══════════════════════════════════════════
   // DISPLAY + EDID
   // ═══════════════════════════════════════════
+
+  test("display: host advertises JetKVM only while session is active", async () => {
+    test.setTimeout(80_000);
+
+    await waitForWebRTCReady(sharedPage);
+    await waitForRpcReady(sharedPage);
+
+    const originalConfig = (await callJsonRpc(sharedPage, "getHostDisplayIdleMode")) as {
+      enabled: boolean;
+    };
+    let hiddenConnectors: string[] = [];
+
+    try {
+      await callJsonRpc(sharedPage, "setHostDisplayIdleMode", { enabled: false });
+
+      const alwaysAdvertisedDisplays = await agent!.waitForDisplays(
+        displays => connectedDisplayConnectors(displays).length > 0,
+        15_000,
+        "connected host display while idle hiding is disabled",
+      );
+      const alwaysAdvertisedConnectors = connectedDisplayConnectors(alwaysAdvertisedDisplays);
+
+      await sharedPage.goto("about:blank");
+      await sharedPage.waitForTimeout(3_000);
+
+      const disabledIdleConnectors = new Set(
+        connectedDisplayConnectors(await agent!.getDisplays()),
+      );
+      expect(
+        alwaysAdvertisedConnectors.every(connector => disabledIdleConnectors.has(connector)),
+        `expected JetKVM display to remain connected when idle hiding is disabled; active=${alwaysAdvertisedConnectors.join(",")} idle=${[...disabledIdleConnectors].join(",")}`,
+      ).toBe(true);
+
+      await sharedPage.goto("/", { waitUntil: "networkidle" });
+      await waitForWebRTCReady(sharedPage);
+      await waitForRpcReady(sharedPage);
+
+      await callJsonRpc(sharedPage, "setHostDisplayIdleMode", { enabled: true });
+
+      const activeDisplays = await agent!.waitForDisplays(
+        displays => connectedDisplayConnectors(displays).length > 0,
+        15_000,
+        "connected host display while WebRTC session is active",
+      );
+      const activeConnectors = connectedDisplayConnectors(activeDisplays);
+
+      await sharedPage.goto("about:blank");
+
+      const idleDisplays = await agent!.waitForDisplays(
+        displays => {
+          const idleConnectors = new Set(connectedDisplayConnectors(displays));
+          hiddenConnectors = activeConnectors.filter(connector => !idleConnectors.has(connector));
+          return hiddenConnectors.length > 0;
+        },
+        20_000,
+        "JetKVM display to disappear from the host after the last session disconnects",
+      );
+
+      const idleConnectors = new Set(connectedDisplayConnectors(idleDisplays));
+      hiddenConnectors = activeConnectors.filter(connector => !idleConnectors.has(connector));
+      expect(
+        hiddenConnectors.length,
+        `expected at least one active connector to disappear; active=${activeConnectors.join(",")} idle=${[...idleConnectors].join(",")}`,
+      ).toBeGreaterThan(0);
+    } finally {
+      await sharedPage.goto("/", { waitUntil: "networkidle" });
+      await waitForWebRTCReady(sharedPage);
+      await waitForRpcReady(sharedPage);
+      await callJsonRpc(sharedPage, "setHostDisplayIdleMode", { enabled: originalConfig.enabled });
+    }
+
+    await agent!.waitForDisplays(
+      displays => {
+        const connected = new Set(connectedDisplayConnectors(displays));
+        return hiddenConnectors.every(connector => connected.has(connector));
+      },
+      20_000,
+      "JetKVM display to reappear on the host after WebRTC reconnects",
+    );
+  });
 
   test("display: resolution, modes, and EDID preset change", async () => {
     test.setTimeout(90_000);
@@ -1585,7 +1916,14 @@ test.describe("Remote Host Agent", () => {
   // ═══════════════════════════════════════════
 
   test("mouse: movement, corners, rapid input, and position values", async () => {
-    await sendAbsMouseMove(sharedPage, 0, 0);
+    // A previous test can leave the host pointer at the center. Wait until at
+    // least one priming move is visible before clearing events; otherwise the
+    // first asserted center move can be a no-op and produce no Linux input event.
+    await agent!.expectMouseMove(async () => {
+      await sendAbsMouseMove(sharedPage, 0, 0);
+      await sendAbsMouseMove(sharedPage, 32767, 32767);
+      await sendAbsMouseMove(sharedPage, 0, 0);
+    }, 5000);
     await agent!.clearAllEvents();
 
     // Center movement
@@ -1842,8 +2180,11 @@ test.describe("Remote Host Agent", () => {
       expect(hWheel.length, "Horizontal wheel in relative-only mode").toBeGreaterThan(0);
       expect(hWheel[0].value).not.toBe(0);
     } finally {
-      await callJsonRpc(sharedPage, "setUsbDevices", { devices: USB_DEVICES_DEFAULT });
-      await agent!.waitForInputDevices(["keyboard", "absolute_mouse", "relative_mouse"], 10000);
+      await setUsbDevicesAndWait(
+        USB_DEVICES_DEFAULT,
+        ["keyboard", "absolute_mouse", "relative_mouse"],
+        10_000,
+      );
     }
   });
 
@@ -2055,8 +2396,9 @@ test.describe("Remote Host Agent", () => {
     const postMountEvents = await waitForKeyboardReady(agent!, sharedPage);
     expect(postMountEvents.length, "keyboard should work after disk mount").toBeGreaterThan(0);
 
-    // Unmount
-    await callJsonRpc(sharedPage, "unmountImage");
+    // Unmount — Disk-mode unmount can hit the EBUSY rebind path plus NBD
+    // disconnect drain, which routinely runs past the default 10s RPC timeout.
+    await callJsonRpc(sharedPage, "unmountImage", {}, 30_000);
     const stateEnd = (await callJsonRpc(sharedPage, "getVirtualMediaState")) as null | object;
     expect(stateEnd).toBeNull();
 
@@ -2190,32 +2532,28 @@ test.describe("Remote Host Agent", () => {
     expect(types).toContain("relative_mouse");
     expect(devices.length).toBe(3);
 
-    // Switch to keyboard_only — verify mice are removed
-    await callJsonRpc(sharedPage, "setUsbDevices", { devices: USB_DEVICES_KEYBOARD_ONLY });
-
-    const afterDevices = await agent!.waitForInputDevices(["keyboard"], 10000);
+    const afterDevices = await setUsbDevicesAndWait(USB_DEVICES_KEYBOARD_ONLY, ["keyboard"]);
     const afterTypes = afterDevices.map(d => d.type);
     expect(afterTypes).toContain("keyboard");
     expect(afterTypes).not.toContain("absolute_mouse");
     expect(afterTypes).not.toContain("relative_mouse");
 
     // Restore default devices
-    await callJsonRpc(sharedPage, "setUsbDevices", { devices: USB_DEVICES_DEFAULT });
-    await agent!.waitForInputDevices(["keyboard", "absolute_mouse", "relative_mouse"], 10000);
+    await setUsbDevicesAndWait(USB_DEVICES_DEFAULT, [
+      "keyboard",
+      "absolute_mouse",
+      "relative_mouse",
+    ]);
 
     // Switch USB descriptor to Logitech — verify host sees new VID/PID
-    await callJsonRpc(sharedPage, "setUsbConfig", { usbConfig: USB_LOGITECH_CONFIG });
-
-    const logitechDevices = await agent!.waitForUSBDevice(d => d.id === ID_LOGITECH, true, 8000);
+    const logitechDevices = await setUsbConfigAndWait(USB_LOGITECH_CONFIG, ID_LOGITECH);
     expect(logitechDevices.length).toBeGreaterThan(0);
     expect(logitechDevices[0].name).toContain("Logitech");
 
     // Restore default descriptor
     const deviceId = (await callJsonRpc(sharedPage, "getDeviceID")) as string;
     const defaultConfig = { ...USB_DEFAULT_CONFIG, serial_number: deviceId || "" };
-    callJsonRpc(sharedPage, "setUsbConfig", { usbConfig: defaultConfig }).catch(() => {
-      /* ignore */
-    });
+    await setUsbConfigAndWait(defaultConfig, ID_DEFAULT);
   });
 
   // ═══════════════════════════════════════════
@@ -2715,103 +3053,90 @@ test.describe("Remote Host Agent", () => {
   });
 
   // ═══════════════════════════════════════════
-  // USB REMOTE WAKEUP: S3 SUSPEND → HID WAKE
+  // USB REMOTE WAKEUP: S3 SUSPEND → EXPLICIT WAKE
   // ═══════════════════════════════════════════
 
-  test("usb-wake: S3 suspend and wake via HID keypress", async () => {
-    test.setTimeout(120_000);
+  test("usb-wake: browser input on no-video overlay does not wake S3 host", async () => {
+    test.setTimeout(180_000);
 
-    // Requires system firmware >= 0.2.8 (f_hid wakeup_on_write kernel patch)
-    const localVersion = (await callJsonRpc(sharedPage, "getLocalVersion")) as {
-      appVersion: string;
-      systemVersion: string;
-    };
-    if (!semverGte(localVersion.systemVersion, "0.2.8")) {
-      test.skip(true, `S3 wake requires system >= 0.2.8 (got ${localVersion.systemVersion})`);
-      return;
-    }
-
-    // Check S3 deep sleep is available on the remote host
-    let memSleep: string;
-    try {
-      memSleep = remoteHostExec("cat /sys/power/mem_sleep").trim();
-    } catch {
-      test.skip(true, "Cannot read /sys/power/mem_sleep on remote host");
-      return;
-    }
-    if (!memSleep.includes("deep") && !memSleep.includes("[mem]")) {
-      test.skip(true, `S3 deep sleep not available (mem_sleep: ${memSleep})`);
-      return;
-    }
-
-    // Enable USB wakeup on JetKVM's USB device (and parent hub)
-    try {
-      remoteHostExec(
-        "for d in /sys/bus/usb/devices/*/; do " +
-          'if grep -q JetKVM "$d/product" 2>/dev/null; then ' +
-          'echo enabled | sudo tee "$d/power/wakeup" > /dev/null; ' +
-          'p=$(dirname $(readlink -f "$d"))/power/wakeup; ' +
-          '[ -f "$p" ] && echo enabled | sudo tee "$p" > /dev/null; ' +
-          "fi; done",
-      );
-    } catch {
-      /* best effort */
-    }
-
-    // Verify everything is working before we suspend
-    await waitForVideoDimensions(sharedPage, 10000);
-    expect(await agent!.health()).toBe(true);
-
-    // Fire-and-forget S3 suspend with a short delay so SSH can return
-    try {
-      remoteHostExec(
-        "sudo sh -c 'nohup sh -c \"sleep 0.5 && echo mem > /sys/power/state\" >/dev/null 2>&1 &'",
-        5000,
-      );
-    } catch {
-      /* SSH may drop during suspend, that's expected */
-    }
-
-    // Give the host 10s to fully enter S3
-    await new Promise(r => setTimeout(r, 10000));
-
-    // Sanity check: host should be unreachable
-    expect(await agent!.health(), "Host should be asleep after 10s").toBe(false);
-
-    // Send wake signal via HID (spacebar press+release)
-    await callJsonRpc(sharedPage, "keyboardReport", {
-      keys: [0x2c, 0, 0, 0, 0, 0],
-      modifier: 0,
+    await putRemoteHostToSleepForUSBWakeTest(sharedPage, {
+      includeRootHubWake: false,
+      wakeAfterSeconds: 90,
     });
-    await callJsonRpc(sharedPage, "keyboardReport", {
-      keys: [0, 0, 0, 0, 0, 0],
-      modifier: 0,
+
+    try {
+      await sendBrowserInputThatMustNotWakeHost(sharedPage);
+      await expectHostStaysAsleep(30_000);
+    } finally {
+      await recoverRemoteHostAfterUSBWakeTest(sharedPage);
+    }
+  });
+
+  test("usb-wake: no-video Wake button wakes S3 host", async () => {
+    test.setTimeout(210_000);
+
+    test.skip(
+      !(await agent!.health()),
+      "Remote host is already asleep; cannot schedule an RTC fallback",
+    );
+
+    await putRemoteHostToSleepForUSBWakeTest(sharedPage, {
+      includeRootHubWake: false,
+      wakeAfterSeconds: 90,
     });
+
+    let wokeWithButton = false;
+    try {
+      await wakeRemoteHostWithWakeButton(sharedPage);
+      wokeWithButton = true;
+    } finally {
+      if (!wokeWithButton) {
+        await recoverRemoteHostAfterUSBWakeTest(sharedPage);
+      }
+    }
+
+    await new Promise(r => setTimeout(r, 5000));
+    await sharedPage.goto("/", { waitUntil: "networkidle" });
+    await waitForWebRTCReady(sharedPage);
+    await waitForVideoDimensions(sharedPage, 30000);
+
+    const postEvents = await waitForKeyboardReady(agent!, sharedPage);
+    expect(postEvents.length, "keyboard should work after S3 Wake button wake").toBeGreaterThan(0);
+  });
+
+  test("usb-wake: S3 suspend and wake via explicit wake RPC", async () => {
+    test.setTimeout(180_000);
+
+    await putRemoteHostToSleepForUSBWakeTest(sharedPage, {
+      includeRootHubWake: false,
+      wakeAfterSeconds: 90,
+    });
+
+    await callJsonRpc(sharedPage, "wakeHost");
 
     // Poll until host wakes up (remote agent responds again)
     const wakeDeadline = Date.now() + 30000;
     let hostUp = false;
-    while (Date.now() < wakeDeadline) {
-      if (await agent!.health()) {
-        hostUp = true;
-        break;
+    try {
+      while (Date.now() < wakeDeadline) {
+        if (await agent!.health()) {
+          hostUp = true;
+          break;
+        }
+        // Re-send wake signal periodically in case the first was lost
+        try {
+          await callJsonRpc(sharedPage, "wakeHost");
+        } catch {
+          /* RPC may fail if WebRTC is reconnecting */
+        }
+        await new Promise(r => setTimeout(r, 2000));
       }
-      // Re-send wake signal periodically in case the first was lost
-      try {
-        await callJsonRpc(sharedPage, "keyboardReport", {
-          keys: [0x2c, 0, 0, 0, 0, 0],
-          modifier: 0,
-        });
-        await callJsonRpc(sharedPage, "keyboardReport", {
-          keys: [0, 0, 0, 0, 0, 0],
-          modifier: 0,
-        });
-      } catch {
-        /* RPC may fail if WebRTC is reconnecting */
+    } finally {
+      if (!hostUp) {
+        await recoverRemoteHostAfterUSBWakeTest(sharedPage);
       }
-      await new Promise(r => setTimeout(r, 2000));
     }
-    expect(hostUp, "Host should wake from S3 after HID wake signal").toBe(true);
+    expect(hostUp, "Host should wake from S3 after explicit wake RPC").toBe(true);
 
     // Wait for video stream to recover after host resume
     await new Promise(r => setTimeout(r, 5000));
@@ -2827,86 +3152,54 @@ test.describe("Remote Host Agent", () => {
     expect(postEvents.length, "keyboard should work after S3 wake").toBeGreaterThan(0);
   });
 
-  test("usb-wake: S3 suspend and wake via mouse input", async () => {
-    test.setTimeout(120_000);
+  test("usb-wake: regular HID reports do not wake from S3", async () => {
+    test.setTimeout(180_000);
 
-    const localVersion = (await callJsonRpc(sharedPage, "getLocalVersion")) as {
-      appVersion: string;
-      systemVersion: string;
-    };
-    if (!semverGte(localVersion.systemVersion, "0.2.8")) {
-      test.skip(true, `S3 wake requires system >= 0.2.8 (got ${localVersion.systemVersion})`);
-      return;
-    }
+    await putRemoteHostToSleepForUSBWakeTest(sharedPage, {
+      includeRootHubWake: false,
+      wakeAfterSeconds: 90,
+    });
 
-    let memSleep: string;
-    try {
-      memSleep = remoteHostExec("cat /sys/power/mem_sleep").trim();
-    } catch {
-      test.skip(true, "Cannot read /sys/power/mem_sleep on remote host");
-      return;
-    }
-    if (!memSleep.includes("deep") && !memSleep.includes("[mem]")) {
-      test.skip(true, `S3 deep sleep not available (mem_sleep: ${memSleep})`);
-      return;
-    }
-
-    // Enable USB wakeup
-    try {
-      remoteHostExec(
-        "for d in /sys/bus/usb/devices/*/; do " +
-          'if grep -q JetKVM "$d/product" 2>/dev/null; then ' +
-          'echo enabled | sudo tee "$d/power/wakeup" > /dev/null; ' +
-          "fi; done",
-      );
-    } catch {
-      /* best effort */
-    }
-
-    await waitForVideoDimensions(sharedPage, 10000);
-    expect(await agent!.health()).toBe(true);
-
-    // Suspend host
-    try {
-      remoteHostExec(
-        "sudo sh -c 'nohup sh -c \"sleep 0.5 && echo mem > /sys/power/state\" >/dev/null 2>&1 &'",
-        5000,
-      );
-    } catch {
-      /* SSH may drop */
-    }
-
-    await new Promise(r => setTimeout(r, 10000));
-    expect(await agent!.health(), "Host should be asleep after 10s").toBe(false);
-
-    // Wake via relative mouse activity. This exercises the boot-style mouse HID
-    // interface, which is typically a more reliable suspend wake source than
-    // the absolute mouse reports used during normal pointer sync.
+    // Keyboard/mouse HID endpoints have wakeup_on_write=0; only the dedicated
+    // wake HID (sent via the wakeHost RPC) can wake the host from S3.
     await callJsonRpc(sharedPage, "relMouseReport", { dx: 8, dy: 0, buttons: 0 });
     await callJsonRpc(sharedPage, "relMouseReport", { dx: 0, dy: 0, buttons: 1 });
     await callJsonRpc(sharedPage, "relMouseReport", { dx: 0, dy: 0, buttons: 0 });
+    await callJsonRpc(sharedPage, "keyboardReport", {
+      keys: [0x2c, 0, 0, 0, 0, 0],
+      modifier: 0,
+    });
+    await callJsonRpc(sharedPage, "keyboardReport", {
+      keys: [0, 0, 0, 0, 0, 0],
+      modifier: 0,
+    });
+
+    await new Promise(r => setTimeout(r, 5000));
+    expect(await agent!.health(), "Host should stay asleep after regular HID reports").toBe(false);
+
+    await callJsonRpc(sharedPage, "wakeHost");
 
     const wakeDeadline = Date.now() + 30000;
     let hostUp = false;
-    while (Date.now() < wakeDeadline) {
-      if (await agent!.health()) {
-        hostUp = true;
-        break;
+    try {
+      while (Date.now() < wakeDeadline) {
+        if (await agent!.health()) {
+          hostUp = true;
+          break;
+        }
+        try {
+          await callJsonRpc(sharedPage, "wakeHost");
+        } catch {
+          /* best effort */
+        }
+        await new Promise(r => setTimeout(r, 2000));
       }
-      try {
-        await callJsonRpc(sharedPage, "relMouseReport", {
-          dx: Math.random() > 0.5 ? 12 : -12,
-          dy: Math.random() > 0.5 ? 6 : -6,
-          buttons: 0,
-        });
-        await callJsonRpc(sharedPage, "relMouseReport", { dx: 0, dy: 0, buttons: 1 });
-        await callJsonRpc(sharedPage, "relMouseReport", { dx: 0, dy: 0, buttons: 0 });
-      } catch {
-        /* best effort */
+    } finally {
+      if (!hostUp) {
+        await recoverRemoteHostAfterUSBWakeTest(sharedPage);
       }
-      await new Promise(r => setTimeout(r, 2000));
     }
-    expect(hostUp, "Host should wake from S3 after mouse input").toBe(true);
+    expect(hostUp, "Host should wake from S3 after explicit wake RPC").toBe(true);
 
     await new Promise(r => setTimeout(r, 5000));
     await sharedPage.goto("/", { waitUntil: "networkidle" });
@@ -2914,7 +3207,7 @@ test.describe("Remote Host Agent", () => {
     await waitForVideoDimensions(sharedPage, 30000);
 
     const postEvents = await waitForKeyboardReady(agent!, sharedPage);
-    expect(postEvents.length, "keyboard should work after S3 mouse wake").toBeGreaterThan(0);
+    expect(postEvents.length, "keyboard should work after S3 wake").toBeGreaterThan(0);
   });
 
   // ═══════════════════════════════════════════

@@ -126,9 +126,7 @@ function stripH265FromVideoTransceivers(pc: RTCPeerConnection) {
       if (t.receiver.track?.kind !== "video") continue;
       t.setCodecPreferences(filtered);
     }
-    console.debug(
-      "[setupPeerConnection] Linux: stripped H.265 from video codec preferences",
-    );
+    console.debug("[setupPeerConnection] Linux: stripped H.265 from video codec preferences");
   } catch (e) {
     console.warn("[setupPeerConnection] setCodecPreferences failed", e);
   }
@@ -175,6 +173,7 @@ export default function KvmIdRoute() {
     peerConnectionState,
     setPeerConnectionState,
     setMediaStream,
+    bumpMediaStreamTrackVersion,
     setRpcDataChannel,
     isTurnServerInUse,
     setTurnServerInUse,
@@ -462,6 +461,10 @@ export default function KvmIdRoute() {
     setConnectionFailed(false);
     setLoadingMessage(m.connecting_to_device());
 
+    // Drop the previous PC's MediaStream — its tracks are ended and
+    // would sit ahead of the new live tracks, breaking playback.
+    setMediaStream(null);
+
     let pc: RTCPeerConnection;
     try {
       console.debug("[setupPeerConnection] Creating peer connection");
@@ -475,7 +478,7 @@ export default function KvmIdRoute() {
       console.debug("[setupPeerConnection] Peer connection created", pc);
       setLoadingMessage(m.setting_up_connection_to_device());
     } catch (e) {
-      console.error(`[setupPeerConnection] Error creating peer connection: ${e}`);
+      console.error(`[setupPeerConnection] Error creating peer connection: ${String(e)}`);
       setTimeout(() => {
         cleanupAndStopReconnecting();
       }, 1000);
@@ -507,7 +510,10 @@ export default function KvmIdRoute() {
           console.log("Legacy signaling. Waiting for ICE Gathering to complete...");
         }
       } catch (e) {
-        console.error(`[setupPeerConnection] Error creating offer: ${e}`, new Date().toISOString());
+        console.error(
+          `[setupPeerConnection] Error creating offer: ${String(e)}`,
+          new Date().toISOString(),
+        );
         cleanupAndStopReconnecting();
       } finally {
         makingOffer.current = false;
@@ -537,10 +543,26 @@ export default function KvmIdRoute() {
     };
 
     pc.ontrack = function (event) {
-      setMediaStream(event.streams[0]);
+      // Assemble a single canonical MediaStream from every incoming track.
+      // We don't trust event.streams[0]: when the answer SDP omits a=msid
+      // for a track (pion does this for audio in some configurations),
+      // Firefox hands us a fresh synthetic stream that would overwrite the
+      // canonical one and strip tracks already attached to it.
+      let stream = useRTCStore.getState().mediaStream;
+      if (!stream) {
+        stream = new MediaStream();
+        setMediaStream(stream);
+      }
+      if (!stream.getTracks().some(t => t.id === event.track.id)) {
+        stream.addTrack(event.track);
+        bumpMediaStreamTrackVersion();
+      }
     };
 
     setTransceiver(pc.addTransceiver("video", { direction: "recvonly" }));
+    // Always offer audio; the backend gates it on device config and leaves
+    // the m-line inactive when disabled.
+    pc.addTransceiver("audio", { direction: "recvonly" });
 
     const rpcDataChannel = pc.createDataChannel("rpc");
     rpcDataChannel.onclose = () => {
@@ -548,7 +570,7 @@ export default function KvmIdRoute() {
       setRpcDataChannel(null);
     };
     rpcDataChannel.onerror = (ev: Event) =>
-      console.error(`Error on DataChannel '${rpcDataChannel.label}': ${ev}`);
+      console.error(`Error on DataChannel '${rpcDataChannel.label}': ${ev.type}`);
     rpcDataChannel.onopen = () => {
       setRpcDataChannel(rpcDataChannel);
     };
@@ -557,7 +579,7 @@ export default function KvmIdRoute() {
     rpcHidChannel.binaryType = "arraybuffer";
     rpcHidChannel.onclose = () => console.log("rpcHidChannel has closed");
     rpcHidChannel.onerror = (ev: Event) =>
-      console.error(`Error on rpcHidChannel '${rpcHidChannel.label}': ${ev}`);
+      console.error(`Error on rpcHidChannel '${rpcHidChannel.label}': ${ev.type}`);
     rpcHidChannel.onopen = () => {
       setRpcHidChannel(rpcHidChannel);
     };
@@ -570,7 +592,9 @@ export default function KvmIdRoute() {
     rpcHidUnreliableChannel.binaryType = "arraybuffer";
     rpcHidUnreliableChannel.onclose = () => console.log("rpcHidUnreliableChannel has closed");
     rpcHidUnreliableChannel.onerror = (ev: Event) =>
-      console.error(`Error on rpcHidUnreliableChannel '${rpcHidUnreliableChannel.label}': ${ev}`);
+      console.error(
+        `Error on rpcHidUnreliableChannel '${rpcHidUnreliableChannel.label}': ${ev.type}`,
+      );
     rpcHidUnreliableChannel.onopen = () => {
       setRpcHidUnreliableChannel(rpcHidUnreliableChannel);
     };
@@ -584,7 +608,7 @@ export default function KvmIdRoute() {
       console.log("rpcHidUnreliableNonOrderedChannel has closed");
     rpcHidUnreliableNonOrderedChannel.onerror = (ev: Event) =>
       console.error(
-        `Error on rpcHidUnreliableNonOrderedChannel '${rpcHidUnreliableNonOrderedChannel.label}': ${ev}`,
+        `Error on rpcHidUnreliableNonOrderedChannel '${rpcHidUnreliableNonOrderedChannel.label}': ${ev.type}`,
       );
     rpcHidUnreliableNonOrderedChannel.onopen = () => {
       setRpcHidUnreliableNonOrderedChannel(rpcHidUnreliableNonOrderedChannel);
@@ -594,7 +618,7 @@ export default function KvmIdRoute() {
     const terminalDataChannel = pc.createDataChannel("terminal");
     terminalDataChannel.onclose = () => console.log("terminalDataChannel has closed");
     terminalDataChannel.onerror = (ev: Event) =>
-      console.error(`Error on terminalDataChannel '${terminalDataChannel.label}': ${ev}`);
+      console.error(`Error on terminalDataChannel '${terminalDataChannel.label}': ${ev.type}`);
     terminalDataChannel.onopen = () => {
       setTerminalChannel(terminalDataChannel);
     };
@@ -606,6 +630,7 @@ export default function KvmIdRoute() {
     legacyHTTPSignaling,
     sendWebRTCSignal,
     setMediaStream,
+    bumpMediaStreamTrackVersion,
     setPeerConnection,
     setPeerConnectionState,
     setRpcDataChannel,

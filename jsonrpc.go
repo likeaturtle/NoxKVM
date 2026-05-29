@@ -52,6 +52,10 @@ type BacklightSettings struct {
 	OffAfter      int `json:"off_after"`
 }
 
+type AudioConfig struct {
+	Enabled bool `json:"enabled"`
+}
+
 func writeJSONRPCResponse(response JSONRPCResponse, session *Session) {
 	responseBytes, err := json.Marshal(response)
 	if err != nil {
@@ -224,6 +228,10 @@ func rpcSetAutoUpdateState(enabled bool) (bool, error) {
 }
 
 func rpcGetEDID() (string, error) {
+	if !isHostDisplayAdvertised() {
+		return configuredVideoEDID(), nil
+	}
+
 	resp, err := nativeInstance.VideoGetEDID()
 	if err != nil {
 		return "", err
@@ -232,19 +240,59 @@ func rpcGetEDID() (string, error) {
 }
 
 func rpcSetEDID(edid string) error {
+	if isInternalDisabledEDID(edid) {
+		return fmt.Errorf("invalid EDID")
+	}
+
 	if edid == "" {
 		logger.Info().Msg("Restoring EDID to default")
 	} else {
 		logger.Info().Str("edid", edid).Msg("Setting EDID")
 	}
-	err := nativeInstance.VideoSetEDID(edid)
-	if err != nil {
+
+	previousEDID := config.EdidString
+	config.EdidString = edid
+
+	if err := reapplyHostDisplayAdvertisement("set_edid"); err != nil {
+		config.EdidString = previousEDID
 		return err
 	}
 
 	// Save EDID to config, allowing it to be restored on reboot.
-	config.EdidString = edid
-	_ = SaveConfig()
+	if err := SaveConfig(); err != nil {
+		config.EdidString = previousEDID
+		_ = reapplyHostDisplayAdvertisement("set_edid_rollback")
+		return fmt.Errorf("failed to save config: %w", err)
+	}
+	return nil
+}
+
+type rpcHostDisplayIdleModeResponse struct {
+	Enabled bool `json:"enabled"`
+}
+
+func rpcGetHostDisplayIdleMode() rpcHostDisplayIdleModeResponse {
+	return rpcHostDisplayIdleModeResponse{Enabled: config.HideDisplayWhenIdle}
+}
+
+func rpcSetHostDisplayIdleMode(enabled bool) error {
+	previous := config.HideDisplayWhenIdle
+	if previous == enabled {
+		return nil
+	}
+
+	config.HideDisplayWhenIdle = enabled
+	if err := applyHostDisplayAdvertisement("set_host_display_disable_when_idle"); err != nil {
+		config.HideDisplayWhenIdle = previous
+		return err
+	}
+
+	if err := SaveConfig(); err != nil {
+		config.HideDisplayWhenIdle = previous
+		_ = applyHostDisplayAdvertisement("set_host_display_disable_when_idle_rollback")
+		return fmt.Errorf("failed to save config: %w", err)
+	}
+
 	return nil
 }
 
@@ -325,6 +373,21 @@ func rpcGetBacklightSettings() (*BacklightSettings, error) {
 		DimAfter:      int(config.DisplayDimAfterSec),
 		OffAfter:      int(config.DisplayOffAfterSec),
 	}, nil
+}
+
+func rpcGetAudioConfig() (*AudioConfig, error) {
+	return &AudioConfig{Enabled: config.AudioEnabled}, nil
+}
+
+func rpcSetAudioConfig(params AudioConfig) error {
+	if config.AudioEnabled == params.Enabled {
+		return nil
+	}
+	config.AudioEnabled = params.Enabled
+	if err := SaveConfig(); err != nil {
+		return fmt.Errorf("failed to save config: %w", err)
+	}
+	return nil
 }
 
 const (
@@ -1257,6 +1320,7 @@ var rpcHandlers = map[string]RPCHandler{
 	"absMouseReport":             {Func: rpcAbsMouseReport, Params: []string{"x", "y", "buttons"}},
 	"relMouseReport":             {Func: rpcRelMouseReport, Params: []string{"dx", "dy", "buttons"}},
 	"wheelReport":                {Func: rpcWheelReport, Params: []string{"wheelY", "wheelX"}},
+	"wakeHost":                   {Func: rpcWakeHost},
 	"getVideoState":              {Func: rpcGetVideoState},
 	"getUSBState":                {Func: rpcGetUSBState},
 	"unmountImage":               {Func: rpcUnmountImage},
@@ -1275,6 +1339,8 @@ var rpcHandlers = map[string]RPCHandler{
 	"setAutoUpdateState":         {Func: rpcSetAutoUpdateState, Params: []string{"enabled"}},
 	"getEDID":                    {Func: rpcGetEDID},
 	"setEDID":                    {Func: rpcSetEDID, Params: []string{"edid"}},
+	"getHostDisplayIdleMode":     {Func: rpcGetHostDisplayIdleMode},
+	"setHostDisplayIdleMode":     {Func: rpcSetHostDisplayIdleMode, Params: []string{"enabled"}},
 	"getVideoLogStatus":          {Func: rpcGetVideoLogStatus},
 	"getVideoSleepMode":          {Func: rpcGetVideoSleepMode},
 	"setVideoSleepMode":          {Func: rpcSetVideoSleepMode, Params: []string{"duration"}},
@@ -1314,6 +1380,8 @@ var rpcHandlers = map[string]RPCHandler{
 	"getDisplayRotation":         {Func: rpcGetDisplayRotation},
 	"setBacklightSettings":       {Func: rpcSetBacklightSettings, Params: []string{"params"}},
 	"getBacklightSettings":       {Func: rpcGetBacklightSettings},
+	"setAudioConfig":             {Func: rpcSetAudioConfig, Params: []string{"params"}},
+	"getAudioConfig":             {Func: rpcGetAudioConfig},
 	"getDCPowerState":            {Func: rpcGetDCPowerState},
 	"setDCPowerState":            {Func: rpcSetDCPowerState, Params: []string{"enabled"}},
 	"setDCRestoreState":          {Func: rpcSetDCRestoreState, Params: []string{"state"}},

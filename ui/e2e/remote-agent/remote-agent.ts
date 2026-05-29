@@ -5,6 +5,7 @@
  */
 
 import { execSync } from "child_process";
+import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
 import { fileURLToPath } from "url";
@@ -54,6 +55,23 @@ export interface DisplayInfo {
   status: "connected" | "disconnected";
   resolution?: string;
   modes?: string[];
+}
+
+export function connectedDisplayConnectors(displays: DisplayInfo[]): string[] {
+  return displays
+    .filter(d => d.status === "connected")
+    .map(d => d.connector)
+    .sort();
+}
+
+export interface AudioDeviceInfo {
+  card: number;
+  device: number;
+  name: string;
+  pcm: string;
+  description?: string;
+  usb_id?: string;
+  is_jetkvm: boolean;
 }
 
 // Linux evdev key codes (matching input-event-codes.h)
@@ -241,12 +259,18 @@ export class RemoteAgent {
   }
 
   /** Check if the agent is running. */
-  async health(): Promise<boolean> {
+  async health(timeoutMs = 2000): Promise<boolean> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const res = await this.get<{ status: string }>("/health");
-      return res.status === "ok";
+      const res = await fetch(`${this.baseUrl}/health`, { signal: controller.signal });
+      if (!res.ok) return false;
+      const body = (await res.json()) as { status: string };
+      return body.status === "ok";
     } catch {
       return false;
+    } finally {
+      clearTimeout(timeout);
     }
   }
 
@@ -296,6 +320,18 @@ export class RemoteAgent {
 
   async getDisplays(): Promise<DisplayInfo[]> {
     return this.get<DisplayInfo[]>("/display");
+  }
+
+  async getAudioDevices(): Promise<AudioDeviceInfo[]> {
+    return this.get<AudioDeviceInfo[]>("/audio/devices");
+  }
+
+  async startAudioTone(): Promise<AudioDeviceInfo> {
+    return this.get<AudioDeviceInfo>("/audio/start-tone");
+  }
+
+  async stopAudioTone(): Promise<void> {
+    await this.get("/audio/stop-tone");
   }
 
   // ── High-level verification helpers ──
@@ -496,6 +532,25 @@ export class RemoteAgent {
     throw new Error(`Timed out waiting for resolution ${expected} (${timeoutMs}ms)`);
   }
 
+  async waitForDisplays(
+    predicate: (displays: DisplayInfo[]) => boolean,
+    timeoutMs = 15000,
+    description = "display state",
+  ): Promise<DisplayInfo[]> {
+    const deadline = Date.now() + timeoutMs;
+    let lastDisplays: DisplayInfo[] = [];
+
+    while (Date.now() < deadline) {
+      lastDisplays = await this.getDisplays();
+      if (predicate(lastDisplays)) return lastDisplays;
+      await sleep(500);
+    }
+
+    throw new Error(
+      `Timed out waiting for ${description} (${timeoutMs}ms). Last displays: ${JSON.stringify(lastDisplays)}`,
+    );
+  }
+
   /**
    * Ensure the remote agent is running on the target host.
    * Always rebuilds from source when it has changed and redeploys.
@@ -529,11 +584,20 @@ export class RemoteAgent {
       });
     }
 
-    // Skip deploy only when the binary hasn't changed and the agent is already running
-    if (!needsBuild && (await this.health())) return;
-
     const sshOpts =
       "-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ConnectTimeout=30 -o ServerAliveInterval=5 -o ServerAliveCountMax=3";
+    const binaryHash = crypto.createHash("sha256").update(fs.readFileSync(binary)).digest("hex");
+    let remoteHash = "";
+    try {
+      remoteHash = execSync(
+        `ssh ${sshOpts} ${target} 'cat /tmp/remote-agent.sha256 2>/dev/null || true'`,
+        { encoding: "utf8" },
+      ).trim();
+    } catch {
+      /* deploy below */
+    }
+
+    if (!needsBuild && remoteHash === binaryHash && (await this.health())) return;
 
     console.log(`[remote-agent] Deploying to ${target}...`);
     // Kill the running agent first — Linux prevents overwriting a running binary
@@ -547,6 +611,7 @@ export class RemoteAgent {
       `ssh ${sshOpts} ${target} 'PORT=${port} nohup /tmp/remote-agent </dev/null >/tmp/remote-agent.log 2>&1 & sleep 0.5'`,
       { stdio: "inherit" },
     );
+    execSync(`ssh ${sshOpts} ${target} 'printf %s ${binaryHash} > /tmp/remote-agent.sha256'`);
 
     await sleep(1500);
 

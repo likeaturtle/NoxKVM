@@ -62,6 +62,16 @@ export async function waitForVideoStream(page: Page, timeout = 30000): Promise<v
     .toBe(true);
 }
 
+export async function waitForAudioStream(page: Page, timeout = 10000): Promise<void> {
+  await expect
+    .poll(async () => page.evaluate(() => window.__kvmTestHooks?.isAudioStreamActive()), {
+      message: "Waiting for audio stream to be active",
+      timeout,
+      intervals: [250, 500],
+    })
+    .toBe(true);
+}
+
 export async function wakeDisplay(page: Page, taps = 3, delayMs = 100): Promise<void> {
   for (let i = 0; i < taps; i++) {
     await tapKey(page, HID_KEY.SPACE);
@@ -750,8 +760,12 @@ export async function restoreSSHDevState(state: SSHDevState): Promise<void> {
 export async function restartAppViaSSH(): Promise<void> {
   await sshExec("killall jetkvm_app", true);
   await new Promise(r => setTimeout(r, 500));
+  // Rotate last.log into last.log.prev before respawning so a later teardown
+  // can still recover the previous session's output if a subsequent restart
+  // truncates the live log. Combined into one SSH call to save a round-trip.
   await sshExec(
-    "setsid env LD_LIBRARY_PATH=/oem/usr/lib:/oem/lib /userdata/jetkvm/bin/jetkvm_app > /userdata/jetkvm/last.log 2>&1 &",
+    "[ -s /userdata/jetkvm/last.log ] && mv /userdata/jetkvm/last.log /userdata/jetkvm/last.log.prev; " +
+      "setsid env LD_LIBRARY_PATH=/oem/usr/lib:/oem/lib /userdata/jetkvm/bin/jetkvm_app > /userdata/jetkvm/last.log 2>&1 &",
     true,
   );
   await new Promise(r => setTimeout(r, 1000));
@@ -925,6 +939,25 @@ export function getDeviceHost(): string {
     throw new Error("JETKVM_URL environment variable is not set");
   }
   return new URL(url).hostname;
+}
+
+/**
+ * Ensure the device is set up with no-password local auth via the HTTP setup API.
+ * No-op if already set up. Used by e2e bootstrap.
+ */
+export async function ensureNoPasswordViaAPI(): Promise<void> {
+  const host = getDeviceHost();
+  const status = await fetch(`http://${host}/device/status`).then(
+    r => r.json() as Promise<{ isSetup: boolean }>,
+  );
+  if (status.isSetup) return;
+
+  const res = await fetch(`http://${host}/device/setup`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ localAuthMode: "noPassword" }),
+  });
+  if (!res.ok) throw new Error(`Setup POST failed: ${res.status}`);
 }
 
 export async function waitForDeviceReady(host: string, timeout = 60000): Promise<void> {

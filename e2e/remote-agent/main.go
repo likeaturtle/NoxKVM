@@ -7,10 +7,14 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -62,18 +66,18 @@ type InputEvent struct {
 	Time   int64  `json:"time_ms"`
 	Type   string `json:"type"`             // "key_press", "key_release", "key_repeat", "mouse_move_rel", "mouse_move_abs", "mouse_button"
 	Code   uint16 `json:"code"`             // Linux key code or axis
-	Value  int32  `json:"value"`             // Key: 0/1/2, Mouse: delta or position
-	X      int32  `json:"x"`                 // Mouse X (for move events)
-	Y      int32  `json:"y"`                 // Mouse Y (for move events)
-	Device string `json:"device,omitempty"`  // Source device name
+	Value  int32  `json:"value"`            // Key: 0/1/2, Mouse: delta or position
+	X      int32  `json:"x"`                // Mouse X (for move events)
+	Y      int32  `json:"y"`                // Mouse Y (for move events)
+	Device string `json:"device,omitempty"` // Source device name
 }
 
 // USBDevice represents a USB device.
 type USBDevice struct {
-	Bus     string `json:"bus"`
-	Device  string `json:"device"`
-	ID      string `json:"id"`
-	Name    string `json:"name"`
+	Bus    string `json:"bus"`
+	Device string `json:"device"`
+	ID     string `json:"id"`
+	Name   string `json:"name"`
 }
 
 // MountInfo represents a mount point.
@@ -145,6 +149,8 @@ func (b *EventBuffer) prune() {
 type Agent struct {
 	keyboardEvents *EventBuffer
 	mouseEvents    *EventBuffer
+	audioMu        sync.Mutex
+	audioToneCmd   *exec.Cmd
 	monitorMu      sync.Mutex
 	absMouseState  struct {
 		mu sync.Mutex
@@ -356,9 +362,9 @@ func listUSBDevices() []USBDevice {
 		}
 
 		devices = append(devices, USBDevice{
-			Bus:    filepath.Base(entry),
-			ID:     vendor + ":" + product,
-			Name:   name,
+			Bus:  filepath.Base(entry),
+			ID:   vendor + ":" + product,
+			Name: name,
 		})
 	}
 
@@ -384,10 +390,21 @@ type InputDeviceInfo struct {
 
 // DisplayInfo represents display/monitor information.
 type DisplayInfo struct {
-	Connector  string `json:"connector"`
-	Status     string `json:"status"` // "connected" or "disconnected"
-	Resolution string `json:"resolution,omitempty"`
+	Connector  string   `json:"connector"`
+	Status     string   `json:"status"` // "connected" or "disconnected"
+	Resolution string   `json:"resolution,omitempty"`
 	Modes      []string `json:"modes,omitempty"`
+}
+
+// AudioDeviceInfo represents an ALSA playback device visible to the remote host.
+type AudioDeviceInfo struct {
+	Card        int    `json:"card"`
+	Device      int    `json:"device"`
+	Name        string `json:"name"`
+	PCM         string `json:"pcm"`
+	Description string `json:"description,omitempty"`
+	USBID       string `json:"usb_id,omitempty"`
+	IsJetKVM    bool   `json:"is_jetkvm"`
 }
 
 // listInputDevices returns all input devices, with JetKVM ones flagged.
@@ -488,6 +505,91 @@ func getDisplayInfo() []DisplayInfo {
 	}
 
 	return displays
+}
+
+var aplayDeviceRE = regexp.MustCompile(`^card ([0-9]+): ([^ ]+) \[(.*)\], device ([0-9]+): .*\[(.*)\]`)
+
+func isJetKVMUSBAudioDevice(d AudioDeviceInfo) bool {
+	if strings.EqualFold(strings.TrimSpace(d.USBID), "1d6b:0104") {
+		return true
+	}
+	return strings.Contains(strings.ToLower(d.Name+" "+d.Description), "jetkvm usb emulation device")
+}
+
+func listAudioDevices() []AudioDeviceInfo {
+	out, err := exec.Command("aplay", "-l").Output()
+	if err != nil {
+		return nil
+	}
+
+	var devices []AudioDeviceInfo
+	for _, line := range strings.Split(string(out), "\n") {
+		m := aplayDeviceRE.FindStringSubmatch(strings.TrimSpace(line))
+		if m == nil {
+			continue
+		}
+
+		card, _ := strconv.Atoi(m[1])
+		device, _ := strconv.Atoi(m[4])
+		streamFile := filepath.Join("/proc/asound", "card"+strconv.Itoa(card), "stream0")
+		description, _, _ := strings.Cut(readSysFile(streamFile), "\n")
+		description = strings.TrimSpace(description)
+
+		d := AudioDeviceInfo{
+			Card:        card,
+			Device:      device,
+			Name:        strings.TrimSpace(m[3]) + " / " + strings.TrimSpace(m[5]),
+			PCM:         fmt.Sprintf("plughw:%d,%d", card, device),
+			Description: description,
+			USBID:       readSysFile(filepath.Join("/proc/asound", "card"+strconv.Itoa(card), "usbid")),
+		}
+		d.IsJetKVM = isJetKVMUSBAudioDevice(d)
+		devices = append(devices, d)
+	}
+	return devices
+}
+
+func (a *Agent) startAudioTone() (AudioDeviceInfo, error) {
+	a.audioMu.Lock()
+	defer a.audioMu.Unlock()
+
+	a.stopAudioToneLocked()
+
+	var device AudioDeviceInfo
+	for _, d := range listAudioDevices() {
+		if d.IsJetKVM {
+			device = d
+			break
+		}
+	}
+	if !device.IsJetKVM {
+		return AudioDeviceInfo{}, os.ErrNotExist
+	}
+
+	// -p 20000 / -b 80000 keeps speaker-test running long enough for the spec's
+	// 12 s deadline without re-arming. 997 Hz at 48 kHz stereo.
+	cmd := exec.Command("speaker-test", "-D", device.PCM, "-t", "sine", "-f", "997", "-r", "48000", "-c", "2", "-p", "20000", "-b", "80000")
+	if err := cmd.Start(); err != nil {
+		return device, err
+	}
+	a.audioToneCmd = cmd
+	return device, nil
+}
+
+func (a *Agent) stopAudioTone() {
+	a.audioMu.Lock()
+	defer a.audioMu.Unlock()
+	a.stopAudioToneLocked()
+}
+
+func (a *Agent) stopAudioToneLocked() {
+	if a.audioToneCmd == nil || a.audioToneCmd.Process == nil {
+		a.audioToneCmd = nil
+		return
+	}
+	_ = a.audioToneCmd.Process.Kill()
+	_ = a.audioToneCmd.Wait()
+	a.audioToneCmd = nil
 }
 
 // listMounts returns current mount points, filtered to interesting ones.
@@ -616,6 +718,28 @@ func main() {
 	mux.HandleFunc("/display", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(getDisplayInfo())
+	})
+
+	mux.HandleFunc("/audio/devices", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(listAudioDevices())
+	})
+
+	mux.HandleFunc("/audio/start-tone", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		device, err := agent.startAudioTone()
+		if err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(device)
+	})
+
+	mux.HandleFunc("/audio/stop-tone", func(w http.ResponseWriter, r *http.Request) {
+		agent.stopAudioTone()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "stopped"})
 	})
 
 	log.Printf("JetKVM Remote Agent listening on :%s", port)
