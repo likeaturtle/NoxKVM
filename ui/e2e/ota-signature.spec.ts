@@ -99,7 +99,7 @@ test.describe("OTA Signature Verification", () => {
     await expect(updateButton).toBeVisible({ timeout: 30000 });
     await updateButton.click();
 
-    await reconnectAfterReboot(page, 35000, 30);
+    await reconnectAfterReboot(page, 35000);
 
     const finalVersion = await getCurrentVersion(page);
     expect(finalVersion).toBe(env.releaseVersion);

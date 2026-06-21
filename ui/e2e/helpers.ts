@@ -52,6 +52,45 @@ export async function waitForWebRTCReady(page: Page, timeout = 30000): Promise<v
     .toBe(true);
 }
 
+/**
+ * Wait until JSON-RPC over WebRTC actually works, verified by a getDeviceID
+ * round-trip. Each attempt claims the WebRTC slot ("Use Here"), waits for the
+ * connection, and probes RPC; on failure it reloads and retries until the
+ * deadline, so a slow reconnect (e.g. after a reboot) recovers instead of
+ * flaking like a single fixed-window wait would.
+ */
+export async function ensureRpcReady(
+  page: Page,
+  {
+    timeoutMs = 60000,
+    navigateFirst = false,
+  }: { timeoutMs?: number; navigateFirst?: boolean } = {},
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown;
+  for (let attempt = 0; Date.now() < deadline; attempt++) {
+    try {
+      // First attempt trusts the caller's existing navigation; retries reload.
+      if (attempt > 0 || navigateFirst) {
+        await page.goto("/", { waitUntil: "networkidle", timeout: 20000 });
+      }
+      const useHere = page.getByRole("button", { name: "Use Here" });
+      if (await useHere.isVisible({ timeout: 200 }).catch(() => false)) {
+        await useHere.click();
+        await page.waitForTimeout(1000);
+      }
+      await waitForWebRTCReady(page, Math.min(15000, Math.max(5000, deadline - Date.now())));
+      await callJsonRpc(page, "getDeviceID", {}, 5000);
+      return;
+    } catch (err) {
+      lastError = err;
+      await page.waitForTimeout(1000);
+    }
+  }
+  const detail = lastError instanceof Error ? lastError.message : String(lastError);
+  throw new Error(`Page never became RPC-ready within ${timeoutMs}ms: ${detail}`);
+}
+
 export async function waitForVideoStream(page: Page, timeout = 30000): Promise<void> {
   await expect
     .poll(async () => page.evaluate(() => window.__kvmTestHooks?.isVideoStreamActive()), {
@@ -400,26 +439,17 @@ export async function getCurrentVersion(page: Page): Promise<string | null> {
   });
 }
 
+/**
+ * Reconnect a page after a device reboot: wait for the device to actually go
+ * down and come back (waitBeforeRetry), then retry until RPC works.
+ */
 export async function reconnectAfterReboot(
   page: Page,
   waitBeforeRetry = 2000,
-  maxRetries = 15,
-  retryInterval = 2000,
+  timeoutMs = 120_000,
 ): Promise<void> {
   await page.waitForTimeout(waitBeforeRetry);
-
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      await page.goto("/", { timeout: 5000 });
-      await waitForWebRTCReady(page, 10000);
-      return;
-    } catch {
-      if (attempt === maxRetries) {
-        throw new Error("Failed to reconnect after reboot");
-      }
-      await page.waitForTimeout(retryInterval);
-    }
-  }
+  await ensureRpcReady(page, { timeoutMs, navigateFirst: true });
 }
 
 const ANIMATION_DELAY = 150;

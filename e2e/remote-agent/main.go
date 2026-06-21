@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -151,6 +152,7 @@ type Agent struct {
 	mouseEvents    *EventBuffer
 	audioMu        sync.Mutex
 	audioToneCmd   *exec.Cmd
+	audioToneDone  chan error
 	monitorMu      sync.Mutex
 	absMouseState  struct {
 		mu sync.Mutex
@@ -566,14 +568,125 @@ func (a *Agent) startAudioTone() (AudioDeviceInfo, error) {
 		return AudioDeviceInfo{}, os.ErrNotExist
 	}
 
-	// -p 20000 / -b 80000 keeps speaker-test running long enough for the spec's
-	// 12 s deadline without re-arming. 997 Hz at 48 kHz stereo.
-	cmd := exec.Command("speaker-test", "-D", device.PCM, "-t", "sine", "-f", "997", "-r", "48000", "-c", "2", "-p", "20000", "-b", "80000")
-	if err := cmd.Start(); err != nil {
-		return device, err
+	// On desktop hosts PipeWire keeps the gadget's PCM open to route desktop
+	// audio, so exclusive hw access (speaker-test) gets EBUSY. Play through
+	// PipeWire when it owns the device; fall back to direct hw on headless
+	// hosts. The sink can appear a second or two after ALSA enumerates the
+	// card (wireplumber is still probing), so keep retrying both paths.
+	var lastErr error
+	deadline := time.Now().Add(8 * time.Second)
+	for attempt := 1; ; attempt++ {
+		var cmd *exec.Cmd
+		if sinkID := findPipeWireSinkID(); sinkID != "" {
+			wav, err := ensureToneWAV()
+			if err != nil {
+				return device, err
+			}
+			cmd = exec.Command("pw-play", "--target", sinkID, wav)
+			cmd.Env = pipewireEnv()
+		} else {
+			// -p 20000 / -b 80000 keeps speaker-test running long enough for the
+			// spec's 12 s deadline without re-arming. 997 Hz at 48 kHz stereo.
+			cmd = exec.Command("speaker-test", "-D", device.PCM, "-t", "sine", "-f", "997", "-r", "48000", "-c", "2", "-p", "20000", "-b", "80000")
+		}
+		var out strings.Builder
+		cmd.Stdout = &out
+		cmd.Stderr = &out
+		if err := cmd.Start(); err != nil {
+			lastErr = err
+		} else {
+			done := make(chan error, 1)
+			go func() { done <- cmd.Wait() }()
+			select {
+			case err := <-done:
+				// Exited immediately — device busy or bad params.
+				lastErr = fmt.Errorf("%s exited: %v: %s", cmd.Path, err, strings.TrimSpace(out.String()))
+				log.Printf("startAudioTone attempt %d: %v", attempt, lastErr)
+			case <-time.After(700 * time.Millisecond):
+				// Still running — tone is playing.
+				a.audioToneCmd = cmd
+				a.audioToneDone = done
+				return device, nil
+			}
+		}
+		if time.Now().After(deadline) {
+			return device, lastErr
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
-	a.audioToneCmd = cmd
-	return device, nil
+}
+
+func pipewireEnv() []string {
+	return append(os.Environ(), fmt.Sprintf("XDG_RUNTIME_DIR=/run/user/%d", os.Getuid()))
+}
+
+var wpctlSinkRE = regexp.MustCompile(`(\d+)\.\s+(.*)`)
+
+// findPipeWireSinkID returns the PipeWire node ID of the sink backing the
+// JetKVM gadget, or "" when PipeWire isn't running or hasn't created it yet.
+func findPipeWireSinkID() string {
+	cmd := exec.Command("wpctl", "status")
+	cmd.Env = pipewireEnv()
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	inSinks := false
+	for _, line := range strings.Split(string(out), "\n") {
+		switch {
+		case strings.Contains(line, "Sinks:"):
+			inSinks = true
+		case strings.Contains(line, "Sink endpoints:") || strings.Contains(line, "Sources:"):
+			inSinks = false
+		case inSinks:
+			// PipeWire names the sink from the USB-ID database: 1d6b:0104 is
+			// "Multifunction Composite Gadget", not anything JetKVM-branded.
+			lower := strings.ToLower(line)
+			if !strings.Contains(lower, "jetkvm") && !strings.Contains(lower, "emulation") &&
+				!strings.Contains(lower, "multifunction composite gadget") {
+				continue
+			}
+			if m := wpctlSinkRE.FindStringSubmatch(line); m != nil {
+				return m[1]
+			}
+		}
+	}
+	return ""
+}
+
+// ensureToneWAV writes a 20 s 997 Hz stereo sine WAV for pw-play (which needs
+// a file, unlike speaker-test's generated tone).
+func ensureToneWAV() (string, error) {
+	const (
+		path = "/tmp/jetkvm-tone.wav"
+		rate = 48000
+		secs = 20
+		amp  = 0.6
+	)
+	if _, err := os.Stat(path); err == nil {
+		return path, nil
+	}
+	frames := rate * secs
+	dataLen := frames * 2 * 2 // stereo, 16-bit
+	buf := make([]byte, 44+dataLen)
+	copy(buf, "RIFF")
+	binary.LittleEndian.PutUint32(buf[4:], uint32(36+dataLen))
+	copy(buf[8:], "WAVEfmt ")
+	binary.LittleEndian.PutUint32(buf[16:], 16)
+	binary.LittleEndian.PutUint16(buf[20:], 1) // PCM
+	binary.LittleEndian.PutUint16(buf[22:], 2) // channels
+	binary.LittleEndian.PutUint32(buf[24:], rate)
+	binary.LittleEndian.PutUint32(buf[28:], rate*2*2)
+	binary.LittleEndian.PutUint16(buf[32:], 4)  // block align
+	binary.LittleEndian.PutUint16(buf[34:], 16) // bits
+	copy(buf[36:], "data")
+	binary.LittleEndian.PutUint32(buf[40:], uint32(dataLen))
+	for i := 0; i < frames; i++ {
+		s := int16(amp * 32767 * math.Sin(2*math.Pi*997*float64(i)/rate))
+		binary.LittleEndian.PutUint16(buf[44+i*4:], uint16(s))
+		binary.LittleEndian.PutUint16(buf[44+i*4+2:], uint16(s))
+	}
+	return path, os.WriteFile(path, buf, 0644)
 }
 
 func (a *Agent) stopAudioTone() {
@@ -588,7 +701,12 @@ func (a *Agent) stopAudioToneLocked() {
 		return
 	}
 	_ = a.audioToneCmd.Process.Kill()
-	_ = a.audioToneCmd.Wait()
+	if a.audioToneDone != nil {
+		<-a.audioToneDone
+		a.audioToneDone = nil
+	} else {
+		_ = a.audioToneCmd.Wait()
+	}
 	a.audioToneCmd = nil
 }
 

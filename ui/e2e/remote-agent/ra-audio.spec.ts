@@ -5,7 +5,7 @@ import {
   waitForAudioStream,
   waitForWebRTCReady,
 } from "../helpers";
-import { createRemoteAgent } from "./remote-agent";
+import { createRemoteAgent, type AudioDeviceInfo } from "./remote-agent";
 
 const agent = createRemoteAgent();
 
@@ -19,13 +19,7 @@ test.afterEach(async () => {
 });
 
 test("audio works end-to-end", async ({ page }) => {
-  test.setTimeout(45_000);
-
-  const devices = await agent!.getAudioDevices();
-  test.skip(
-    !devices.some(d => d.is_jetkvm),
-    `No JetKVM USB ALSA playback device on remote host: ${JSON.stringify(devices)}`,
-  );
+  test.setTimeout(60_000);
 
   // Audio is opt-in via device config (Settings → Audio → Enable Audio).
   // First connect with audio off, flip the setting via RPC, then reload so
@@ -38,6 +32,21 @@ test("audio works end-to-end", async ({ page }) => {
     await page.reload({ waitUntil: "networkidle" });
     await waitForWebRTCReady(page);
     await waitForAudioStream(page);
+
+    // The UAC gadget is only presented to the host while audio is enabled,
+    // so the capability check must run after setAudioConfig — and the host
+    // needs a few seconds to enumerate the new USB function.
+    let devices: AudioDeviceInfo[] = [];
+    const enumerateDeadline = Date.now() + 15_000;
+    while (Date.now() < enumerateDeadline) {
+      devices = await agent!.getAudioDevices();
+      if (devices.some(d => d.is_jetkvm)) break;
+      await new Promise(r => setTimeout(r, 1000));
+    }
+    test.skip(
+      !devices.some(d => d.is_jetkvm),
+      `No JetKVM USB ALSA playback device on remote host: ${JSON.stringify(devices)}`,
+    );
 
     const before = (await page.evaluate(() => window.__kvmTestHooks?.getInboundAudioStats())) ?? {
       bytesReceived: 0,

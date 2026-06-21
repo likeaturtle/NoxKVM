@@ -73,7 +73,7 @@ test.describe("OTA Specific Version Unsigned", () => {
         { timeout: 30000 },
       );
 
-      await reconnectAfterReboot(page, 35000, 30);
+      await reconnectAfterReboot(page, 35000);
 
       const finalVersion = await getCurrentVersion(page);
       expect(finalVersion).toBe(env.releaseVersion);

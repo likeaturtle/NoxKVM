@@ -106,7 +106,7 @@ test.describe("Log level filtering", () => {
         .toBe("INFO");
 
       await rebootDeviceViaSSH();
-      await reconnectAfterReboot(page, 3000, 20);
+      await reconnectAfterReboot(page, 3000);
 
       await expect
         .poll(() => callJsonRpc(page, "getDefaultLogLevel"), {

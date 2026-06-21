@@ -101,7 +101,7 @@ test.describe("OTA Upgrade to Signed Release", () => {
     });
 
     await test.step("Reconnect after reboot", async () => {
-      await reconnectAfterReboot(page, 35000, 30);
+      await reconnectAfterReboot(page, 35000);
     });
 
     await test.step("Verify update installed", async () => {

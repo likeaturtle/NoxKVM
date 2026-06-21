@@ -17,6 +17,7 @@ import {
   sendKeypress,
   tapKey,
   waitForWebRTCReady,
+  ensureRpcReady,
   waitForVideoDimensions,
   sendAbsMouseMove,
   sshExec,
@@ -285,8 +286,7 @@ async function putRemoteHostToSleepForUSBWakeTest(
 async function recoverRemoteHostAfterUSBWakeTest(page: Page, timeoutMs = 120000): Promise<void> {
   await waitForHostAwake(timeoutMs);
   await page.goto("/", { waitUntil: "networkidle" });
-  await waitForWebRTCReady(page);
-  await waitForRpcReady(page);
+  await ensureRpcReady(page);
   await waitForVideoDimensions(page, 30000);
 }
 
@@ -474,17 +474,38 @@ async function sendUsbReconfigRpc(
   }
 }
 
+// When the host xHCI misses a gadget re-enumeration, waiting longer never
+// converges — re-send the RPC each round (it always unbind+rebinds the UDC,
+// which re-kicks host enumeration).
+async function usbReconfigWithRetry<T>(
+  method: "setUsbDevices" | "setUsbConfig",
+  params: Record<string, unknown>,
+  waitForState: (attemptMs: number) => Promise<T>,
+  timeoutMs: number,
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    await sendUsbReconfigRpc(method, params);
+    const attemptMs = Math.max(Math.min(15_000, deadline - Date.now()), 1_000);
+    try {
+      return await waitForState(attemptMs);
+    } catch (err) {
+      if (Date.now() >= deadline) throw err;
+    }
+  }
+}
+
 async function setUsbDevicesAndWait(
   devices: typeof USB_DEVICES_DEFAULT,
   expectedTypes: string[],
   timeoutMs = 45_000,
 ) {
-  // A gadget rebind can finish after the browser-side JSON-RPC test hook times
-  // out, especially after virtual-media EBUSY cleanup has left the host xHCI
-  // stack re-enumerating. Treat that timeout as command accepted, then poll the
-  // host-visible input devices for the state that actually matters.
-  await sendUsbReconfigRpc("setUsbDevices", { devices });
-  return agent!.waitForInputDevices(expectedTypes, timeoutMs);
+  return usbReconfigWithRetry(
+    "setUsbDevices",
+    { devices },
+    attemptMs => agent!.waitForInputDevices(expectedTypes, attemptMs),
+    timeoutMs,
+  );
 }
 
 async function setUsbConfigAndWait(
@@ -492,8 +513,12 @@ async function setUsbConfigAndWait(
   expectedId: string,
   timeoutMs = 45_000,
 ) {
-  await sendUsbReconfigRpc("setUsbConfig", { usbConfig });
-  return agent!.waitForUSBDevice(d => d.id === expectedId, true, timeoutMs);
+  return usbReconfigWithRetry(
+    "setUsbConfig",
+    { usbConfig },
+    attemptMs => agent!.waitForUSBDevice(d => d.id === expectedId, true, attemptMs),
+    timeoutMs,
+  );
 }
 
 // Pre-built key list for batched keyboard scan test
@@ -568,30 +593,6 @@ async function setupMacrosViaRPC(page: Page, retries = 3) {
   }
 }
 
-async function waitForRpcReady(page: Page, timeoutMs = 30000) {
-  const deadline = Date.now() + timeoutMs;
-  let reloaded = false;
-  while (Date.now() < deadline) {
-    const useHereBtn = page.getByRole("button", { name: "Use Here" });
-    if (await useHereBtn.isVisible({ timeout: 200 }).catch(() => false)) {
-      await useHereBtn.click();
-      await new Promise(r => setTimeout(r, 2000));
-    }
-    try {
-      await callJsonRpc(page, "getDeviceID");
-      return;
-    } catch {
-      if (!reloaded && Date.now() > deadline - timeoutMs + 10000) {
-        reloaded = true;
-        await page.reload({ waitUntil: "networkidle" });
-        await waitForWebRTCReady(page);
-      }
-      await new Promise(r => setTimeout(r, 1000));
-    }
-  }
-  throw new Error(`RPC channel not ready after ${timeoutMs}ms`);
-}
-
 test.beforeAll(async ({ browser }) => {
   test.skip(!agent, "JETKVM_REMOTE_HOST not set");
 
@@ -611,13 +612,11 @@ test.beforeAll(async ({ browser }) => {
     await sharedPage.goto("/", { waitUntil: "networkidle" });
   }
 
-  await waitForWebRTCReady(sharedPage);
-  await waitForRpcReady(sharedPage);
+  await ensureRpcReady(sharedPage);
 
   await setupMacrosViaRPC(sharedPage);
   await sharedPage.reload({ waitUntil: "networkidle" });
-  await waitForWebRTCReady(sharedPage);
-  await waitForRpcReady(sharedPage);
+  await ensureRpcReady(sharedPage);
 
   await agent!.waitForInputDevices(["keyboard", "absolute_mouse", "relative_mouse"], 30000);
 
@@ -770,8 +769,7 @@ test.describe("Remote Host Agent", () => {
   test("display: host advertises JetKVM only while session is active", async () => {
     test.setTimeout(80_000);
 
-    await waitForWebRTCReady(sharedPage);
-    await waitForRpcReady(sharedPage);
+    await ensureRpcReady(sharedPage);
 
     const originalConfig = (await callJsonRpc(sharedPage, "getHostDisplayIdleMode")) as {
       enabled: boolean;
@@ -800,8 +798,7 @@ test.describe("Remote Host Agent", () => {
       ).toBe(true);
 
       await sharedPage.goto("/", { waitUntil: "networkidle" });
-      await waitForWebRTCReady(sharedPage);
-      await waitForRpcReady(sharedPage);
+      await ensureRpcReady(sharedPage);
 
       await callJsonRpc(sharedPage, "setHostDisplayIdleMode", { enabled: true });
 
@@ -832,8 +829,7 @@ test.describe("Remote Host Agent", () => {
       ).toBeGreaterThan(0);
     } finally {
       await sharedPage.goto("/", { waitUntil: "networkidle" });
-      await waitForWebRTCReady(sharedPage);
-      await waitForRpcReady(sharedPage);
+      await ensureRpcReady(sharedPage);
       await callJsonRpc(sharedPage, "setHostDisplayIdleMode", { enabled: originalConfig.enabled });
     }
 
@@ -871,8 +867,7 @@ test.describe("Remote Host Agent", () => {
     await callJsonRpc(sharedPage, "setEDID", { edid: targetEdid }, 30000).catch(() => {});
     await new Promise(r => setTimeout(r, 5000));
     await sharedPage.goto("/", { waitUntil: "networkidle" });
-    await waitForWebRTCReady(sharedPage);
-    await waitForRpcReady(sharedPage);
+    await ensureRpcReady(sharedPage);
 
     // Wait for the remote agent to recover and report a resolution.
     // The agent may be briefly unreachable during display re-negotiation.
@@ -895,8 +890,7 @@ test.describe("Remote Host Agent", () => {
     await new Promise(r => setTimeout(r, 5000));
 
     await sharedPage.goto("/", { waitUntil: "networkidle" });
-    await waitForWebRTCReady(sharedPage);
-    await waitForRpcReady(sharedPage);
+    await ensureRpcReady(sharedPage);
     await agent!.waitForInputDevices(["keyboard", "absolute_mouse", "relative_mouse"], 15000);
 
     // Verify keyboard works after EDID changes
@@ -1812,8 +1806,7 @@ test.describe("Remote Host Agent", () => {
     await freshPage.close();
 
     await sharedPage.goto("/", { waitUntil: "networkidle" });
-    await waitForWebRTCReady(sharedPage);
-    await waitForRpcReady(sharedPage);
+    await ensureRpcReady(sharedPage);
 
     await expect
       .poll(
@@ -1841,8 +1834,7 @@ test.describe("Remote Host Agent", () => {
 
     try {
       await oldPage.goto("/", { waitUntil: "networkidle" });
-      await waitForWebRTCReady(oldPage);
-      await waitForRpcReady(oldPage);
+      await ensureRpcReady(oldPage);
 
       await agent!.clearKeyboardEvents();
       await callJsonRpc(oldPage, "keypressReport", { key: 0xe1, press: true });
@@ -1866,8 +1858,7 @@ test.describe("Remote Host Agent", () => {
 
       replacementPage = await browser.newPage();
       await replacementPage.goto("/", { waitUntil: "networkidle" });
-      await waitForWebRTCReady(replacementPage);
-      await waitForRpcReady(replacementPage);
+      await ensureRpcReady(replacementPage);
 
       await expect
         .poll(
@@ -1909,8 +1900,7 @@ test.describe("Remote Host Agent", () => {
       await oldPage.close().catch(() => {});
 
       await sharedPage.goto("/", { waitUntil: "networkidle" });
-      await waitForWebRTCReady(sharedPage);
-      await waitForRpcReady(sharedPage);
+      await ensureRpcReady(sharedPage);
     }
   });
 
@@ -1919,14 +1909,20 @@ test.describe("Remote Host Agent", () => {
   // ═══════════════════════════════════════════
 
   test("mouse: movement, corners, rapid input, and position values", async () => {
+    // Default 60s can be eaten by priming retries; keep headroom for the rest.
+    test.setTimeout(90_000);
+
     // A previous test can leave the host pointer at the center. Wait until at
     // least one priming move is visible before clearing events; otherwise the
     // first asserted center move can be a no-op and produce no Linux input event.
-    await agent!.expectMouseMove(async () => {
-      await sendAbsMouseMove(sharedPage, 0, 0);
-      await sendAbsMouseMove(sharedPage, 32767, 32767);
-      await sendAbsMouseMove(sharedPage, 0, 0);
-    }, 5000);
+    // Re-send on timeout — a batch sent right after session churn can be lost.
+    await expect(async () => {
+      await agent!.expectMouseMove(async () => {
+        await sendAbsMouseMove(sharedPage, 0, 0);
+        await sendAbsMouseMove(sharedPage, 32767, 32767);
+        await sendAbsMouseMove(sharedPage, 0, 0);
+      }, 3000);
+    }).toPass({ timeout: 20_000 });
     await agent!.clearAllEvents();
 
     // Center movement
@@ -2135,12 +2131,12 @@ test.describe("Remote Host Agent", () => {
   });
 
   test("mouse: wheel scroll works in relative-only mouse mode", async () => {
-    test.setTimeout(30_000);
+    test.setTimeout(90_000);
     const REL_WHEEL = 0x08;
     const REL_HWHEEL = 0x06;
 
     await callJsonRpc(sharedPage, "setUsbDevices", { devices: USB_DEVICES_REL_MOUSE_ONLY });
-    await agent!.waitForInputDevices(["keyboard", "relative_mouse"], 10000);
+    await agent!.waitForInputDevices(["keyboard", "relative_mouse"], 15000);
 
     // After USB device re-enumeration the remote agent needs time to re-open
     // the new /dev/input/event* nodes — poll with retries instead of fixed sleep.
@@ -2183,11 +2179,12 @@ test.describe("Remote Host Agent", () => {
       expect(hWheel.length, "Horizontal wheel in relative-only mode").toBeGreaterThan(0);
       expect(hWheel[0].value).not.toBe(0);
     } finally {
-      await setUsbDevicesAndWait(
-        USB_DEVICES_DEFAULT,
-        ["keyboard", "absolute_mouse", "relative_mouse"],
-        10_000,
-      );
+      // Host xHCI re-enumeration regularly exceeds 10s; use the 45s default.
+      await setUsbDevicesAndWait(USB_DEVICES_DEFAULT, [
+        "keyboard",
+        "absolute_mouse",
+        "relative_mouse",
+      ]);
     }
   });
 
@@ -2468,19 +2465,17 @@ test.describe("Remote Host Agent", () => {
       return;
     }
 
-    // Mount the ISO on the remote host — triggers PREVENT MEDIUM REMOVAL SCSI command,
-    // which causes the KVM kernel to return EBUSY when clearing the backing file.
-    const mountPoint = "/tmp/jetkvm-e2e-cdrom";
+    // Lock the CDROM medium — sends PREVENT MEDIUM REMOVAL, which causes the
+    // KVM kernel to return EBUSY when clearing the backing file. Lock via
+    // eject -i instead of mounting the ISO: a mount reads filesystem data the
+    // device streams over HTTP on demand, and a stalled stream leaves an
+    // unkillable D-state mount on the host that aborts all later S3 suspends
+    // (userspace freeze fails after 20s).
     try {
-      remoteHostExec(`sudo mkdir -p ${mountPoint} && sudo mount -o ro ${blockDev} ${mountPoint}`);
+      remoteHostExec(`sudo eject -i on ${blockDev}`);
     } catch {
-      // If ISO mount fails, try eject -i on as fallback to lock the medium
-      try {
-        remoteHostExec(`sudo eject -i on ${blockDev}`);
-      } catch {
-        test.skip(true, "Could not lock CDROM medium on remote host");
-        return;
-      }
+      test.skip(true, "Could not lock CDROM medium on remote host");
+      return;
     }
 
     try {
@@ -2501,14 +2496,7 @@ test.describe("Remote Host Agent", () => {
         "keyboard should work after EBUSY unmount fallback",
       ).toBeGreaterThan(0);
     } finally {
-      // Clean up: unmount on remote host (may already be ejected by USB rebind)
-      try {
-        remoteHostExec(
-          `sudo umount -l ${mountPoint} 2>/dev/null; sudo rmdir ${mountPoint} 2>/dev/null`,
-        );
-      } catch {
-        /* best effort */
-      }
+      // Clean up: unlock the medium (may already be gone after the USB rebind)
       try {
         remoteHostExec(`sudo eject -i off ${blockDev} 2>/dev/null`);
       } catch {
@@ -2522,6 +2510,9 @@ test.describe("Remote Host Agent", () => {
   // ═══════════════════════════════════════════
 
   test("usb: device presence, switching, and descriptor changes", async () => {
+    // Four sequential gadget reconfigs, each allowed up to 45s with rebind retries.
+    test.setTimeout(240_000);
+
     // Verify JetKVM is connected with default devices
     const device = await agent!.expectJetKVMConnected();
     expect(device).toBeDefined();
@@ -2608,7 +2599,8 @@ test.describe("Remote Host Agent", () => {
   // ═══════════════════════════════════════════
 
   test("usb: USB Serial Console terminal sends and receives data via ttyGS0", async () => {
-    test.setTimeout(60_000);
+    // Budget for the ModemManager-probe wait plus typed-string retries.
+    test.setTimeout(120_000);
 
     test.skip(!process.env.JETKVM_REMOTE_HOST, "JETKVM_REMOTE_HOST not set");
 
@@ -2621,6 +2613,16 @@ test.describe("Remote Host Agent", () => {
     // Find the ttyACM device on the remote host
     const ttyACM = await waitForRemoteHostTtyACM(true);
     expect(ttyACM).toContain("ttyACM");
+
+    // ModemManager probes a freshly created ttyACM port and consumes data,
+    // racing with our reader. Wait until nothing on the host holds the port.
+    await expect
+      .poll(() => remoteHostExec(`sudo lsof -t ${ttyACM} 2>/dev/null || true`).trim(), {
+        message: `waiting for ${ttyACM} to be free of host processes`,
+        timeout: 30_000,
+        intervals: [1000],
+      })
+      .toBe("");
 
     // Reload the page so the action bar picks up serial_console enabled state
     await sharedPage.reload({ waitUntil: "networkidle" });
@@ -2635,18 +2637,19 @@ test.describe("Remote Host Agent", () => {
     await new Promise(r => setTimeout(r, 1000));
 
     // Configure the remote serial port and start a background reader
-    const testString = `e2e_test_${Date.now()}`;
     remoteHostExec(`sudo stty -F ${ttyACM} 9600 raw -echo`);
     remoteHostExec(`sudo bash -c 'nohup cat ${ttyACM} > /tmp/cdcacm_rx.txt 2>/dev/null &'`);
     await new Promise(r => setTimeout(r, 500));
 
-    // Type a string into the USB Serial Console terminal
-    await sharedPage.keyboard.type(testString, { delay: 50 });
-    await new Promise(r => setTimeout(r, 2000));
-
-    // Read what the remote host received
-    const received = remoteHostExec("sudo cat /tmp/cdcacm_rx.txt 2>/dev/null || echo EMPTY").trim();
-    expect(received).toContain(testString);
+    // Type into the terminal, retrying: right after the button click the
+    // terminal's data channel may still be attaching and drop keystrokes.
+    await expect(async () => {
+      const sentString = `e2e_test_${Date.now()}`;
+      await sharedPage.keyboard.type(sentString, { delay: 50 });
+      await new Promise(r => setTimeout(r, 2000));
+      const received = remoteHostExec("sudo cat /tmp/cdcacm_rx.txt 2>/dev/null || true").trim();
+      expect(received).toContain(sentString);
+    }).toPass({ timeout: 20_000 });
 
     // Test receiving data: send from remote host to ttyACM
     const replyString = `reply_${Date.now()}`;
@@ -2878,8 +2881,7 @@ test.describe("Remote Host Agent", () => {
     await callJsonRpc(sharedPage, "setEDID", { edid: EDID_1366x768 }, 30000).catch(() => {});
     await new Promise(r => setTimeout(r, 3000));
     await sharedPage.goto("/", { waitUntil: "networkidle" });
-    await waitForWebRTCReady(sharedPage);
-    await waitForRpcReady(sharedPage);
+    await ensureRpcReady(sharedPage);
 
     try {
       await agent!.waitForResolution("1366x768", 15_000);
@@ -3283,8 +3285,7 @@ test.describe("Remote Host Agent", () => {
     const freshPage = await context.newPage();
     try {
       await freshPage.goto("/");
-      await freshPage.waitForLoadState("networkidle");
-      await waitForWebRTCReady(freshPage);
+      await ensureRpcReady(freshPage);
 
       const fs = await import("fs");
       const os = await import("os");
