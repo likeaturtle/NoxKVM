@@ -2,6 +2,7 @@ bin/*
 static/*
 .idea
 .DS_Store
+.vscode
 
 .cache
 .vite
