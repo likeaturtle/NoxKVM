@@ -9,9 +9,12 @@
 import { execSync } from "child_process";
 import { test, expect, type Page } from "@playwright/test";
 import {
+  DWC3_PATH,
   HID_KEY,
   SSH_OPTS,
+  UDC_NAME,
   callJsonRpc,
+  waitForUdcState,
   getKeysDownState,
   pauseKeepAlive,
   sendKeypress,
@@ -30,11 +33,12 @@ import {
 import {
   createRemoteAgent,
   connectedDisplayConnectors,
+  waitForKeyboardReady,
   KEY,
   HID_TO_LINUX,
-  type RemoteAgent,
   type MouseEvent as RAMouseEvent,
   type KeyboardEvent as RAKeyboardEvent,
+  type MountInfo,
 } from "./remote-agent";
 
 /** Run a command on the remote host (the machine whose display is captured by the KVM). */
@@ -102,35 +106,6 @@ async function waitForRemoteHostTtyACM(
   );
 }
 
-/**
- * Retry keyboard round-trip (send Space, verify host received it) until success
- * or timeout. Used after USB rebinds where the HID channel needs time to stabilize.
- */
-async function waitForKeyboardReady(
-  ra: RemoteAgent,
-  page: Page,
-  timeoutMs = 30000,
-  perTryMs = 3000,
-): Promise<RAKeyboardEvent[]> {
-  const deadline = Date.now() + timeoutMs;
-  let events: RAKeyboardEvent[] = [];
-  while (Date.now() < deadline) {
-    try {
-      events = await ra.expectKeyPress(
-        KEY.SPACE,
-        async () => {
-          await tapKey(page, HID_KEY.SPACE);
-        },
-        perTryMs,
-      );
-      return events;
-    } catch {
-      /* HID not ready yet */
-    }
-  }
-  return events;
-}
-
 /** Toggle DPMS on the remote host via GNOME ScreenSaver D-Bus API. */
 function remoteHostSetDPMS(off: boolean): void {
   remoteHostExec(
@@ -154,6 +129,10 @@ function remoteHostSupportsS3(): { supported: boolean; reason?: string } {
   }
 
   return { supported: true };
+}
+
+function mountKey(mount: MountInfo): string {
+  return `${mount.device}|${mount.mount_point}`;
 }
 
 function enableRemoteHostUSBWake(options: { includeRootHub?: boolean } = {}): void {
@@ -412,6 +391,7 @@ const USB_DEVICES_DEFAULT = {
   absolute_mouse: true,
   relative_mouse: true,
   mass_storage: true,
+  audio: true,
 };
 
 const USB_DEVICES_KEYBOARD_ONLY = {
@@ -430,34 +410,6 @@ const USB_DEVICES_REL_MOUSE_ONLY = {
 
 const ID_DEFAULT = "1d6b:0104";
 const ID_LOGITECH = "046d:c52b";
-
-// ── UDC recovery constants ──
-
-const UDC_NAME = "ffb00000.usb";
-const DWC3_PATH = "/sys/bus/platform/drivers/dwc3";
-const UDC_STATE_PATH = `/sys/class/udc/${UDC_NAME}/state`;
-
-async function readUdcState(): Promise<string> {
-  try {
-    const result = (await sshExec(`cat ${UDC_STATE_PATH} 2>/dev/null`, true)).trim();
-    return result || "not attached";
-  } catch {
-    return "not attached";
-  }
-}
-
-async function waitForUdcState(expected: string, timeoutMs: number): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  let lastSeen = "";
-  while (Date.now() < deadline) {
-    lastSeen = await readUdcState();
-    if (lastSeen === expected) return;
-    await new Promise(resolve => setTimeout(resolve, 250));
-  }
-  throw new Error(
-    `Timed out waiting for UDC state "${expected}" within ${timeoutMs}ms (last seen: "${lastSeen}")`,
-  );
-}
 
 function isJsonRpcTimeout(err: unknown, method: string): boolean {
   return err instanceof Error && err.message.includes(`RPC timeout for ${method}`);
@@ -2325,6 +2277,9 @@ test.describe("Remote Host Agent", () => {
   // VIRTUAL MEDIA
   // ═══════════════════════════════════════════
 
+  const MISSING_IMAGE_URL = "https://deb.debian.org/debian/jetkvm-missing-image.iso";
+  const MISSING_IMAGE_ERROR = /The URL is not available/;
+
   test("virtual-media: mount ISO from URL and verify, then unmount", async () => {
     test.setTimeout(60_000);
 
@@ -2360,6 +2315,59 @@ test.describe("Remote Host Agent", () => {
 
     const finalDevices = await agent!.getUSBDevices();
     expect(finalDevices.length).toBeGreaterThan(0);
+  });
+
+  test("virtual-media: unavailable URL is rejected without mounting", async () => {
+    test.setTimeout(30_000);
+
+    try {
+      await callJsonRpc(sharedPage, "unmountImage");
+    } catch {
+      /* ok if nothing mounted */
+    }
+
+    const stateBefore = (await callJsonRpc(sharedPage, "getVirtualMediaState")) as null | object;
+    expect(stateBefore).toBeNull();
+
+    const baselineMounts = new Set((await agent!.getMounts()).map(mountKey));
+
+    await expect(
+      callJsonRpc(sharedPage, "mountWithHTTP", { url: MISSING_IMAGE_URL, mode: "CDROM" }),
+    ).rejects.toThrow(MISSING_IMAGE_ERROR);
+
+    const stateAfter = (await callJsonRpc(sharedPage, "getVirtualMediaState")) as null | object;
+    expect(stateAfter).toBeNull();
+
+    await agent!.waitForMount(mount => !baselineMounts.has(mountKey(mount)), false, 5_000);
+  });
+
+  test("virtual-media: URL mount form shows unavailable image error", async () => {
+    test.setTimeout(30_000);
+
+    try {
+      await callJsonRpc(sharedPage, "unmountImage");
+    } catch {
+      /* ok if nothing mounted */
+    }
+
+    const baselineMounts = new Set((await agent!.getMounts()).map(mountKey));
+
+    await sharedPage.getByRole("button", { name: "Virtual Media" }).click();
+    await sharedPage.getByRole("button", { name: "Add New Media" }).click();
+    await sharedPage.getByRole("button", { name: "Continue" }).click();
+    await sharedPage.getByPlaceholder("https://example.com/image.iso").fill(MISSING_IMAGE_URL);
+    await sharedPage.getByRole("button", { name: "Mount URL" }).click();
+
+    await expect(sharedPage.getByRole("heading", { name: "Mount Error" })).toBeVisible();
+    await expect(sharedPage.getByText(MISSING_IMAGE_ERROR)).toBeVisible();
+
+    const stateAfter = (await callJsonRpc(sharedPage, "getVirtualMediaState")) as null | object;
+    expect(stateAfter).toBeNull();
+
+    await agent!.waitForMount(mount => !baselineMounts.has(mountKey(mount)), false, 5_000);
+
+    await sharedPage.getByRole("button", { name: "Close" }).click();
+    await ensureRpcReady(sharedPage);
   });
 
   test("virtual-media: mount ISO as Disk mode preserves keyboard (#560)", async () => {
@@ -2555,39 +2563,39 @@ test.describe("Remote Host Agent", () => {
   // ═══════════════════════════════════════════
 
   test("usb: serial console CDC-ACM toggle creates and removes ttyACM on host", async () => {
-    test.setTimeout(30_000);
+    test.setTimeout(90_000);
 
     test.skip(!process.env.JETKVM_REMOTE_HOST, "JETKVM_REMOTE_HOST not set");
 
-    // Ensure serial console is off initially
-    await callJsonRpc(sharedPage, "setUsbDevices", {
-      devices: { ...USB_DEVICES_DEFAULT, serial_console: false },
-    });
-
     // Verify the host does NOT see a ttyACM device
-    const beforeACM = await waitForRemoteHostTtyACM(false);
+    const beforeACM = await usbReconfigWithRetry(
+      "setUsbDevices",
+      { devices: { ...USB_DEVICES_DEFAULT, serial_console: false } },
+      attemptMs => waitForRemoteHostTtyACM(false, attemptMs),
+      45_000,
+    );
     expect(beforeACM).toBe("");
 
-    // Enable serial console
-    await callJsonRpc(sharedPage, "setUsbDevices", {
-      devices: { ...USB_DEVICES_DEFAULT, serial_console: true },
-    });
-
     // Verify the host now sees a ttyACM device
-    const afterACM = await waitForRemoteHostTtyACM(true);
+    const afterACM = await usbReconfigWithRetry(
+      "setUsbDevices",
+      { devices: { ...USB_DEVICES_DEFAULT, serial_console: true } },
+      attemptMs => waitForRemoteHostTtyACM(true, attemptMs),
+      45_000,
+    );
     expect(afterACM).toContain("ttyACM");
 
     // Verify /dev/ttyGS0 exists on the KVM device
     const afterGS0 = (await sshExec("ls /dev/ttyGS0 2>/dev/null || echo MISSING", true)).trim();
     expect(afterGS0).toBe("/dev/ttyGS0");
 
-    // Disable serial console
-    await callJsonRpc(sharedPage, "setUsbDevices", {
-      devices: { ...USB_DEVICES_DEFAULT, serial_console: false },
-    });
-
     // Verify the host no longer sees a ttyACM device
-    const removedACM = await waitForRemoteHostTtyACM(false);
+    const removedACM = await usbReconfigWithRetry(
+      "setUsbDevices",
+      { devices: { ...USB_DEVICES_DEFAULT, serial_console: false } },
+      attemptMs => waitForRemoteHostTtyACM(false, attemptMs),
+      45_000,
+    );
     expect(removedACM).toBe("");
 
     // Verify other USB functions still work (keyboard, mouse)

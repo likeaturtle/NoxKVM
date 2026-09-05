@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -22,35 +24,6 @@ import (
 	"github.com/psanford/httpreadat"
 )
 
-func writeFile(path string, data string) error {
-	return os.WriteFile(path, []byte(data), 0644)
-}
-
-func getMassStorageImage() (string, error) {
-	massStorageFunctionPath, err := gadget.GetPath("mass_storage_lun0")
-	if err != nil {
-		return "", fmt.Errorf("failed to get mass storage path: %w", err)
-	}
-
-	imagePath, err := os.ReadFile(path.Join(massStorageFunctionPath, "file"))
-	if err != nil {
-		return "", fmt.Errorf("failed to get mass storage image path: %w", err)
-	}
-	return strings.TrimSpace(string(imagePath)), nil
-}
-
-func setMassStorageImage(imagePath string) error {
-	massStorageFunctionPath, err := gadget.GetPath("mass_storage_lun0")
-	if err != nil {
-		return fmt.Errorf("failed to get mass storage path: %w", err)
-	}
-
-	if err := writeFile(path.Join(massStorageFunctionPath, "file"), imagePath); err != nil {
-		return fmt.Errorf("failed to set image path: %w", err)
-	}
-	return nil
-}
-
 // rebindAndRecoverHID performs a corrective USB rebind with recovery poller
 // suppression, resets HID file handles, waits for the kernel to re-attach the
 // HID function driver, and reopens the keyboard chardev.
@@ -59,12 +32,11 @@ func rebindAndRecoverHID(context string) error {
 	if err := gadget.RebindUsb(true); err != nil {
 		return fmt.Errorf("%s: corrective USB rebind failed: %w", context, err)
 	}
-	setUSBRecoveryTimer(time.Now())
 	gadget.ResetHIDFiles()
-	time.Sleep(1 * time.Second)
-	if err := gadget.OpenKeyboardHidFile(); err != nil {
-		usbLogger.Warn().Err(err).Msgf("failed to reopen keyboard HID file after %s rebind", context)
+	if !tryReopenKeyboard(context, false) {
+		usbLogger.Warn().Msgf("keyboard HID file not ready after %s rebind", context)
 	}
+	setUSBRecoveryTimer(time.Now())
 	return nil
 }
 
@@ -111,15 +83,15 @@ func setMassStorageMode(cdrom bool) error {
 }
 
 func mountImage(imagePath string) error {
-	err := setMassStorageImage("")
+	err := gadget.SetMassStorageImage("")
 	if err != nil {
 		return fmt.Errorf("remove mass storage image error: %w", err)
 	}
-	err = setMassStorageImage(imagePath)
+	err = gadget.SetMassStorageImage(imagePath)
 	if err != nil {
 		return fmt.Errorf("set mass storage image error: %w", err)
 	}
-	err = setMassStorageImage(imagePath)
+	err = gadget.SetMassStorageImage(imagePath)
 	if err != nil {
 		return fmt.Errorf("set Mass Storage Image Error: %w", err)
 	}
@@ -195,13 +167,105 @@ func getMassStorageCDROMEnabled() (bool, error) {
 }
 
 type VirtualMediaUrlInfo struct {
-	Usable bool
-	Reason string //only populated if Usable is false
-	Size   int64
+	Usable bool   `json:"usable"`
+	Reason string `json:"reason,omitempty"`
+	Size   int64  `json:"size"`
 }
 
-func rpcCheckMountUrl(url string) (*VirtualMediaUrlInfo, error) {
-	return nil, errors.New("not implemented")
+func rpcCheckMountUrl(rawURL string) (*VirtualMediaUrlInfo, error) {
+	rawURL = strings.TrimSpace(rawURL)
+	parsedURL, err := neturl.Parse(rawURL)
+	if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
+		return &VirtualMediaUrlInfo{
+			Usable: false,
+			Reason: "Enter a valid HTTP or HTTPS image URL.",
+		}, nil
+	}
+	if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
+		return &VirtualMediaUrlInfo{
+			Usable: false,
+			Reason: "Only HTTP and HTTPS image URLs can be mounted.",
+		}, nil
+	}
+
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check url: %w", err)
+	}
+	req.Header.Set("Range", "bytes=0-0")
+
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		logger.Warn().Err(err).Str("url", rawURL).Msg("failed to check virtual media url")
+		return &VirtualMediaUrlInfo{
+			Usable: false,
+			Reason: "The URL is not available. Check the image URL and try again.",
+		}, nil
+	}
+	if err := resp.Body.Close(); err != nil {
+		logger.Warn().Err(err).Str("url", rawURL).Msg("failed to close virtual media url check response")
+	}
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		status := fmt.Sprintf("HTTP %d", resp.StatusCode)
+		if statusText := http.StatusText(resp.StatusCode); statusText != "" {
+			status += " " + statusText
+		}
+		return &VirtualMediaUrlInfo{
+			Usable: false,
+			Reason: fmt.Sprintf("The URL is not available (%s). Check the image URL and try again.", status),
+		}, nil
+	}
+
+	if resp.StatusCode != http.StatusPartialContent {
+		return &VirtualMediaUrlInfo{
+			Usable: false,
+			Reason: "The URL is available, but the server does not support byte-range requests.",
+		}, nil
+	}
+
+	contentRange := strings.TrimSpace(resp.Header.Get("Content-Range"))
+	if strings.HasSuffix(contentRange, "/*") {
+		return &VirtualMediaUrlInfo{
+			Usable: false,
+			Reason: "The URL is available, but the server did not report the image size.",
+		}, nil
+	}
+
+	rangeFields := strings.Fields(contentRange)
+	if len(rangeFields) != 2 || strings.ToLower(rangeFields[0]) != "bytes" {
+		return &VirtualMediaUrlInfo{
+			Usable: false,
+			Reason: "The URL is available, but the server returned an unreadable range response.",
+		}, nil
+	}
+
+	rangeParts := strings.Split(rangeFields[1], "/")
+	if len(rangeParts) != 2 || rangeParts[1] == "*" {
+		return &VirtualMediaUrlInfo{
+			Usable: false,
+			Reason: "The URL is available, but the server returned an unreadable range response.",
+		}, nil
+	}
+
+	size, err := strconv.ParseInt(rangeParts[1], 10, 64)
+	if err != nil {
+		return &VirtualMediaUrlInfo{
+			Usable: false,
+			Reason: "The URL is available, but the server returned an unreadable range response.",
+		}, nil
+	}
+	if size <= 0 {
+		return &VirtualMediaUrlInfo{
+			Usable: false,
+			Reason: "The URL points to an empty file.",
+		}, nil
+	}
+
+	return &VirtualMediaUrlInfo{
+		Usable: true,
+		Size:   size,
+	}, nil
 }
 
 type VirtualMediaSource string
@@ -239,20 +303,16 @@ func unmountImageLocked() error {
 	virtualMediaStateMutex.Lock()
 	defer virtualMediaStateMutex.Unlock()
 
-	err := setMassStorageImage("\n")
+	err := gadget.SetMassStorageImage("\n")
 	if err != nil {
 		if !errors.Is(err, syscall.EBUSY) {
 			return fmt.Errorf("failed to unmount image: %w", err)
 		}
 
-		logger.Warn().Err(err).Msg("unmount failed with EBUSY, rebinding USB gadget to force-eject")
+		logger.Warn().Err(err).Msg("unmount failed with EBUSY, force-ejecting via soft disconnect")
 
-		if rebindErr := rebindAndRecoverHID("ebusy-unmount"); rebindErr != nil {
-			return fmt.Errorf("failed to unmount image: %w, %w", err, rebindErr)
-		}
-
-		if retryErr := setMassStorageImage("\n"); retryErr != nil {
-			return fmt.Errorf("failed to unmount image after gadget rebind: %w", retryErr)
+		if ejectErr := gadget.ForceEjectMassStorageImage(); ejectErr != nil {
+			return fmt.Errorf("failed to unmount image: %w, %w", err, ejectErr)
 		}
 	}
 
@@ -283,7 +343,7 @@ func getInitialVirtualMediaState() (*VirtualMediaState, error) {
 		return nil, fmt.Errorf("failed to get mass storage cdrom enabled: %w", err)
 	}
 
-	diskPath, err := getMassStorageImage()
+	diskPath, err := gadget.GetMassStorageImage()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get mass storage image: %w", err)
 	}
@@ -332,17 +392,30 @@ func setInitialVirtualMediaState() error {
 }
 
 func prepareHTTPMount(url string, mode VirtualMediaMode) error {
+	url = strings.TrimSpace(url)
+
+	virtualMediaStateMutex.RLock()
+	alreadyMounted := currentVirtualMediaState != nil
+	virtualMediaStateMutex.RUnlock()
+	if alreadyMounted {
+		return fmt.Errorf("another virtual media is already mounted")
+	}
+
+	urlInfo, err := rpcCheckMountUrl(url)
+	if err != nil {
+		return err
+	}
+	if !urlInfo.Usable {
+		return errors.New(urlInfo.Reason)
+	}
+
 	virtualMediaStateMutex.Lock()
 	defer virtualMediaStateMutex.Unlock()
 	if currentVirtualMediaState != nil {
 		return fmt.Errorf("another virtual media is already mounted")
 	}
 	httpRangeReader = httpreadat.New(url)
-	n, err := httpRangeReader.Size()
-	if err != nil {
-		return fmt.Errorf("failed to use http url: %w", err)
-	}
-	logger.Info().Str("url", url).Int64("size", n).Msg("using remote url")
+	logger.Info().Str("url", url).Int64("size", urlInfo.Size).Msg("using remote url")
 
 	if err := setMassStorageMode(mode == CDROM); err != nil {
 		return fmt.Errorf("failed to set mass storage mode: %w", err)
@@ -352,7 +425,7 @@ func prepareHTTPMount(url string, mode VirtualMediaMode) error {
 		Source: HTTP,
 		Mode:   mode,
 		URL:    url,
-		Size:   n,
+		Size:   urlInfo.Size,
 	}
 	return nil
 }
@@ -372,7 +445,7 @@ func rpcMountWithHTTP(url string, mode VirtualMediaMode) error {
 	logger.Debug().Msg("nbd device started")
 	//TODO: replace by polling on block device having right size
 	time.Sleep(1 * time.Second)
-	err = setMassStorageImage("/dev/nbd0")
+	err = gadget.SetMassStorageImage("/dev/nbd0")
 	if err != nil {
 		return err
 	}
@@ -400,7 +473,7 @@ func prepareStorageMount(filename string, mode VirtualMediaMode) error {
 		return fmt.Errorf("failed to set mass storage mode: %w", err)
 	}
 
-	err = setMassStorageImage(fullPath)
+	err = gadget.SetMassStorageImage(fullPath)
 	if err != nil {
 		return fmt.Errorf("failed to set mass storage image: %w", err)
 	}

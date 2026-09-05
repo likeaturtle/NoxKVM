@@ -80,7 +80,7 @@ export async function ensureRpcReady(
         await page.waitForTimeout(1000);
       }
       await waitForWebRTCReady(page, Math.min(15000, Math.max(5000, deadline - Date.now())));
-      await callJsonRpc(page, "getDeviceID", {}, 5000);
+      await rawJsonRpc(page, "getDeviceID", {}, 5000);
       return;
     } catch (err) {
       lastError = err;
@@ -715,9 +715,15 @@ export const SSH_OPTS = [
 const SSH_MAX_RETRIES = 3;
 const SSH_RETRY_BASE_DELAY_MS = 2000;
 const SSH_COMMAND_TIMEOUT_MS = 15000;
+const REMOTE_APP_PATH = "/userdata/jetkvm/bin/jetkvm_app";
+const REMOTE_DEBUG_APP_PATH = "/userdata/jetkvm/bin/jetkvm_app_debug";
 
 function escapeForSingleQuotedShell(cmd: string): string {
   return cmd.replace(/'/g, "'\\''");
+}
+
+function shellSingleQuote(value: string): string {
+  return `'${escapeForSingleQuotedShell(value)}'`;
 }
 
 export async function sshExec(cmd: string, ignoreErrors = false): Promise<string> {
@@ -760,6 +766,32 @@ export async function resetConfigViaSSH(): Promise<void> {
   await sshExec("sync");
 }
 
+export const UDC_NAME = "ffb00000.usb";
+export const DWC3_PATH = "/sys/bus/platform/drivers/dwc3";
+export const UDC_STATE_PATH = `/sys/class/udc/${UDC_NAME}/state`;
+
+async function readUdcState(): Promise<string> {
+  try {
+    const result = (await sshExec(`cat ${UDC_STATE_PATH} 2>/dev/null`, true)).trim();
+    return result || "not attached";
+  } catch {
+    return "not attached";
+  }
+}
+
+export async function waitForUdcState(expected: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let lastSeen = "";
+  while (Date.now() < deadline) {
+    lastSeen = await readUdcState();
+    if (lastSeen === expected) return;
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  throw new Error(
+    `Timed out waiting for UDC state "${expected}" within ${timeoutMs}ms (last seen: "${lastSeen}")`,
+  );
+}
+
 export interface SSHDevState {
   sshKey: string;
   devModeEnabled: boolean;
@@ -787,15 +819,30 @@ export async function restoreSSHDevState(state: SSHDevState): Promise<void> {
   }
 }
 
+async function getRestartAppPathViaSSH(): Promise<string> {
+  const configuredPath = process.env.E2E_REMOTE_APP_PATH;
+  if (configuredPath) return configuredPath;
+
+  const runningDebug = await sshExec(
+    `for exe in /proc/[0-9]*/exe; do ` +
+      `target=$(readlink "$exe" 2>/dev/null || true); ` +
+      `case "$target" in */jetkvm_app_debug) echo 1; exit 0;; esac; ` +
+      `done`,
+    true,
+  );
+  return runningDebug.trim() === "1" ? REMOTE_DEBUG_APP_PATH : REMOTE_APP_PATH;
+}
+
 export async function restartAppViaSSH(): Promise<void> {
-  await sshExec("killall jetkvm_app", true);
+  const appPath = await getRestartAppPathViaSSH();
+  await sshExec("killall jetkvm_app jetkvm_app_debug", true);
   await new Promise(r => setTimeout(r, 500));
   // Rotate last.log into last.log.prev before respawning so a later teardown
   // can still recover the previous session's output if a subsequent restart
   // truncates the live log. Combined into one SSH call to save a round-trip.
   await sshExec(
     "[ -s /userdata/jetkvm/last.log ] && mv /userdata/jetkvm/last.log /userdata/jetkvm/last.log.prev; " +
-      "setsid env LD_LIBRARY_PATH=/oem/usr/lib:/oem/lib /userdata/jetkvm/bin/jetkvm_app > /userdata/jetkvm/last.log 2>&1 &",
+      `setsid env LD_LIBRARY_PATH=/oem/usr/lib:/oem/lib ${shellSingleQuote(appPath)} > /userdata/jetkvm/last.log 2>&1 &`,
     true,
   );
   await new Promise(r => setTimeout(r, 1000));
@@ -1023,10 +1070,10 @@ export async function rebootDeviceViaSSH(waitForReady = true): Promise<void> {
   }
 }
 
-export async function callJsonRpc(
+async function rawJsonRpc(
   page: Page,
   method: string,
-  params: Record<string, unknown> = {},
+  params: Record<string, unknown>,
   timeoutMs?: number,
 ): Promise<unknown> {
   return page.evaluate(
@@ -1050,6 +1097,25 @@ export async function callJsonRpc(
     },
     { method, params, timeoutMs },
   );
+}
+
+const RPC_CHANNEL_DROPPED =
+  /RPC data channel not available|Test hooks not available|Execution context was destroyed/;
+
+export async function callJsonRpc(
+  page: Page,
+  method: string,
+  params: Record<string, unknown> = {},
+  timeoutMs?: number,
+): Promise<unknown> {
+  try {
+    return await rawJsonRpc(page, method, params, timeoutMs);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!RPC_CHANNEL_DROPPED.test(msg)) throw err;
+    await ensureRpcReady(page, { timeoutMs: 20000 });
+    return rawJsonRpc(page, method, params, timeoutMs);
+  }
 }
 
 // ── OTA: Mock Update Server ──
