@@ -3,7 +3,7 @@
 
 ### NoxKVM
 
-[Discord](https://jetkvm.com/discord) | [Issues](https://github.com/likeaturtle/NoxKVM/issues)
+[Discord](https://jetkvm.com/discord) | [Website](https://jetkvm.com) | [Issues](https://github.com/likeaturtle/NoxKVM/issues) | [文档](https://jetkvm.com/docs)
 
 </div>
 
@@ -12,7 +12,7 @@ NoxKVM 是一个高性能、开源的 KVM over IP（键盘、视频、鼠标）�
 ## 功能特性
 
 - **超低延迟** - 1080p@60FPS 视频，H.264 编码，30-60ms 延迟，鼠标键盘交互流畅
-- **免费远程访问** - 通过 WebRTC 进行远程管理
+- **免费远程访问** - 通过 JetKVM Cloud 使用 WebRTC 进行远程管理
 - **可选 Tailscale 组网** - 内置 Tailscale 状态管理，支持自定义 [Headscale](https://headscale.net/) 端点
 - **开源软件** - 基于 Go + TypeScript 开发，可通过 SSH 访问设备进行自定义
 
@@ -36,7 +36,9 @@ NoxKVM 是一个高性能、开源的 KVM over IP（键盘、视频、鼠标）�
 
 ## 开发
 
-项目包含两部分：运行在 KVM 设备上的后端（Go）和设备提供的前端（React + TypeScript）。
+项目使用 Go、TypeScript 和少量 C 编写。建议具备中等水平的 Go 和 TypeScript 知识。
+
+项目包含两部分：运行在 KVM 设备上的后端和设备提供的前端（云端也使用同一前端）。
 
 详细的开发信息（环境搭建、测试、调试、贡献指南）请参阅 **[DEVELOPMENT.md](DEVELOPMENT.md)**。
 
