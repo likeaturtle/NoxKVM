@@ -18,11 +18,25 @@ NoxKVM 是一个高性能、开源的 KVM over IP（键盘、视频、鼠标）�
 
 ## 与上游的关系
 
-本项目 fork 自 [jetkvm/kvm](https://github.com/jetkvm/kvm)，在此基础上增加了：
+本项目 fork 自 [jetkvm/kvm](https://github.com/jetkvm/kvm)，在此基础上做了以下改动：
+
+### 构建与发布
 
 - 自动化 GitHub Actions 发布流水线（`release.yml`）
 - 腾讯云 COS 对象存储作为固件分发 CDN
 - 通过 OTA 元数据自动触发 cos-index-repo 索引更新
+- 新增本地交叉编译工具链脚本（`setup_toolchain.sh`）和编译指南
+
+### 代码改动
+
+- **OTA 更新源**：`config.go` 中 `DefaultAPIURL` 改为指向自建 COS 存储
+- **GPG 签名密钥**：`internal/ota/gpg.go` 中 `rootKeyFingerprint` 替换为自签名密钥
+- **镜像存储路径**：`usb_mass_storage.go` 中 `imagesFolder` 从 `/userdata/jetkvm/images` 改为 `/mnt/sdcard`，适配 SD 卡存储
+
+### 文档
+
+- 中文 README 和本地编译指南
+- WebRTC ICE 连接卡住问题的解决方案
 
 ## 参与贡献
 
