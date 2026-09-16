@@ -166,9 +166,11 @@ jobs:
           secret_key = ${{ secrets.TENCENT_SECRET_KEY }}
           bucket = ${{ secrets.TENCENT_COS_BUCKET }}
           region = ${{ secrets.TENCENT_COS_REGION }}
-          part_size = 5
+          max_thread = 20
+          part_size = 1
           retry = 5
           timeout = 120
+          schema = https
           EOF
           sed -i 's/^          //' ~/.cos.conf
 
