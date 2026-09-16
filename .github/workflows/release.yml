@@ -286,7 +286,7 @@ jobs:
     name: Trigger cos-index-repo update
     steps:
       - name: Dispatch workflow
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.COS_INDEX_PAT }}
           script: |
@@ -294,8 +294,5 @@ jobs:
               owner: 'likeaturtle',
               repo: 'cos-index-repo',
               workflow_id: 'update-cos-index.yml',
-              ref: 'main',
-              inputs: {
-                version: '${{ needs.build.outputs.version }}'
-              }
+              ref: 'main'
             });
