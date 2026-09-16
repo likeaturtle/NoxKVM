@@ -10,11 +10,6 @@ on:
         description: 'Release version (e.g., v0.4.9)'
         required: true
         type: string
-      upload_to_tos:
-        description: 'Upload to Volcengine TOS'
-        required: false
-        type: boolean
-        default: true
 
 permissions:
   contents: write
@@ -34,7 +29,6 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             VERSION=${{ inputs.version }}
-            # Remove 'v' prefix if present for internal use
             VERSION=${VERSION#v}
           else
             VERSION=${GITHUB_REF_NAME#v}
@@ -149,19 +143,66 @@ jobs:
             jetkvm_app.sig
           generate_release_notes: true
 
-  # Upload release artifacts to Volcengine TOS (optional)
-  upload-tos:
+  upload-cos:
     needs: [build, release]
-    if: ${{ github.event.inputs.upload_to_tos != 'false' }}
-    uses: ./.github/workflows/upload-tos.yml
-    with:
-      version: ${{ needs.build.outputs.version }}
-      artifact_name: jetkvm-release
-    secrets:
-      TOS_ACCESS_KEY: ${{ secrets.TOS_ACCESS_KEY }}
-      TOS_SECRET_KEY: ${{ secrets.TOS_SECRET_KEY }}
+    runs-on: ubuntu-latest
+    name: Upload to Tencent COS
+    env:
+      COS_BASE_PATH: noxkvm/app
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: jetkvm-release
 
-  # Generate and deploy OTA update metadata to GitHub Pages
+      - name: Install coscmd
+        run: pip install coscmd
+
+      - name: Configure coscmd
+        run: |
+          coscmd config \
+            -a "${{ secrets.TENCENT_SECRET_ID }}" \
+            -s "${{ secrets.TENCENT_SECRET_KEY }}" \
+            -b "${{ secrets.TENCENT_COS_BUCKET }}" \
+            -r "${{ secrets.TENCENT_COS_REGION }}"
+
+      - name: Upload to COS versioned directory
+        run: |
+          VERSION=${{ needs.build.outputs.version }}
+          coscmd upload -r ./ "${COS_BASE_PATH}/${VERSION}/"
+
+      - name: Upload to COS latest directory
+        run: |
+          coscmd upload -r --delete ./ "${COS_BASE_PATH}/latest/"
+
+      - name: Build OTA metadata
+        run: |
+          VERSION=${{ needs.build.outputs.version }}
+          COS_BASE="https://${{ secrets.TENCENT_COS_BUCKET }}.cos.${{ secrets.TENCENT_COS_REGION }}.myqcloud.com"
+          HASH_VALUE=$(cat jetkvm_app.sha256 | cut -d' ' -f1)
+
+          cat > releases <<EOF
+          {
+            "appVersion": "${VERSION}",
+            "appUrl": "${COS_BASE}/${COS_BASE_PATH}/latest/jetkvm_app",
+            "appHash": "${HASH_VALUE}",
+            "appSigUrl": "${COS_BASE}/${COS_BASE_PATH}/latest/jetkvm_app.sig",
+            "systemVersion": "0.0.1",
+            "systemUrl": "",
+            "systemHash": ""
+          }
+          EOF
+
+          cp releases latest.json
+          echo "OTA metadata:"
+          cat releases
+
+      - name: Upload OTA metadata to COS
+        run: |
+          VERSION=${{ needs.build.outputs.version }}
+          coscmd upload releases "${COS_BASE_PATH}/${VERSION}/releases"
+          coscmd upload latest.json "${COS_BASE_PATH}/latest/releases"
+
   deploy-pages:
     needs: [build, release]
     runs-on: ubuntu-latest
@@ -181,18 +222,15 @@ jobs:
         run: |
           VERSION=${{ needs.build.outputs.version }}
           REPO="${{ github.repository }}"
-          
-          # Get release upload URL and asset URLs
+
           RELEASE_DATA=$(gh api repos/${REPO}/releases/tags/v${VERSION})
-          
-          # Extract asset browser download URLs (these are publicly accessible)
+
           APP_URL=$(echo "$RELEASE_DATA" | jq -r '.assets[] | select(.name == "jetkvm_app") | .browser_download_url')
           SIG_URL=$(echo "$RELEASE_DATA" | jq -r '.assets[] | select(.name == "jetkvm_app.sig") | .browser_download_url')
           HASH_URL=$(echo "$RELEASE_DATA" | jq -r '.assets[] | select(.name == "jetkvm_app.sha256") | .browser_download_url')
-          
-          # Download hash file to get the actual hash value
+
           HASH_VALUE=$(curl -sL "${HASH_URL}" | cut -d' ' -f1)
-          
+
           echo "app_url=${APP_URL}" >> $GITHUB_OUTPUT
           echo "sig_url=${SIG_URL}" >> $GITHUB_OUTPUT
           echo "hash=${HASH_VALUE}" >> $GITHUB_OUTPUT
@@ -201,7 +239,7 @@ jobs:
       - name: Generate OTA metadata
         run: |
           mkdir -p ./pages
-          
+
           cat > ./pages/releases << EOF
           {
             "appVersion": "${{ steps.release-info.outputs.version }}",
@@ -213,10 +251,8 @@ jobs:
             "systemHash": ""
           }
           EOF
-          
-          # Also create a latest.json for convenience
+
           cp ./pages/releases ./pages/latest.json
-          
           cat ./pages/releases
 
       - name: Setup Pages
