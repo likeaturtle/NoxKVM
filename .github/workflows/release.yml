@@ -170,6 +170,7 @@ jobs:
           retry = 5
           timeout = 120
           EOF
+          sed -i 's/^          //' ~/.cos.conf
 
       - name: Upload to COS versioned directory
         run: |
