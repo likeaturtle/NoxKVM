@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unsafe"
 )
@@ -382,9 +383,10 @@ func listUSBDevices() []USBDevice {
 		}
 
 		devices = append(devices, USBDevice{
-			Bus:  filepath.Base(entry),
-			ID:   vendor + ":" + product,
-			Name: name,
+			Bus:    readSysFile(filepath.Join(entry, "busnum")),
+			Device: readSysFile(filepath.Join(entry, "devnum")),
+			ID:     vendor + ":" + product,
+			Name:   name,
 		})
 	}
 
@@ -603,8 +605,7 @@ func (a *Agent) startAudioTone() (AudioDeviceInfo, error) {
 			if err != nil {
 				return device, err
 			}
-			cmd = exec.Command("pw-play", "--target", sinkName, wav)
-			cmd.Env = pipewireEnv()
+			cmd = pipewireCommand("pw-play", "--target", sinkName, wav)
 		} else {
 			// -p 20000 / -b 80000 keeps speaker-test running long enough for the
 			// spec's 12 s deadline without re-arming. 997 Hz at 48 kHz stereo.
@@ -637,15 +638,24 @@ func (a *Agent) startAudioTone() (AudioDeviceInfo, error) {
 	}
 }
 
-func pipewireEnv() []string {
-	return append(os.Environ(), fmt.Sprintf("XDG_RUNTIME_DIR=/run/user/%d", os.Getuid()))
+func pipewireCommand(name string, args ...string) *exec.Cmd {
+	// The agent runs under sudo; PipeWire belongs to the original desktop user.
+	cmd := exec.Command(name, args...)
+	uid, uidErr := strconv.ParseUint(os.Getenv("SUDO_UID"), 10, 32)
+	gid, gidErr := strconv.ParseUint(os.Getenv("SUDO_GID"), 10, 32)
+	if os.Geteuid() == 0 && uidErr == nil && gidErr == nil && uid != 0 {
+		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}}
+	} else {
+		uid = uint64(os.Getuid())
+	}
+	cmd.Env = append(os.Environ(), fmt.Sprintf("XDG_RUNTIME_DIR=/run/user/%d", uid))
+	return cmd
 }
 
 // findPipeWireSinkName returns the playback node for the selected ALSA card.
 // pw-play accepts node.name or object.serial, not the reusable IDs from wpctl.
 func findPipeWireSinkName(card int) string {
-	cmd := exec.Command("pw-dump")
-	cmd.Env = pipewireEnv()
+	cmd := pipewireCommand("pw-dump")
 	out, err := cmd.Output()
 	if err != nil {
 		return ""
@@ -674,13 +684,13 @@ func pipeWireSinkName(data []byte, card int) string {
 	return ""
 }
 
-// ensureToneWAV writes a 20 s 997 Hz stereo sine WAV for pw-play (which needs
-// a file, unlike speaker-test's generated tone).
+// ensureToneWAV writes a 60 s 997 Hz stereo sine WAV for pw-play, covering
+// audio setup and the sustained test's 30 s observation window.
 func ensureToneWAV() (string, error) {
 	const (
-		path = "/tmp/jetkvm-tone.wav"
+		path = "/tmp/jetkvm-tone-60s.wav"
 		rate = 48000
-		secs = 20
+		secs = 60
 		amp  = 0.6
 	)
 	if _, err := os.Stat(path); err == nil {
@@ -784,6 +794,8 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /storage/readback", handleStorageReadback)
+	mux.HandleFunc("POST /ntp", handleNTP)
 
 	// Health check
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
