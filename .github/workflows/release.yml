@@ -266,3 +266,23 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
+  update-cos-index:
+    needs: [build, release, upload-cos]
+    runs-on: ubuntu-latest
+    name: Trigger cos-index-repo update
+    steps:
+      - name: Dispatch workflow
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.COS_INDEX_PAT }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: 'likeaturtle',
+              repo: 'cos-index-repo',
+              workflow_id: 'update-cos-index.yml',
+              ref: 'main',
+              inputs: {
+                version: '${{ needs.build.outputs.version }}'
+              }
+            });
