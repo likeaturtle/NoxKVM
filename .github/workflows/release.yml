@@ -160,25 +160,30 @@ jobs:
 
       - name: Configure coscmd
         run: |
-          coscmd config \
-            -a "${{ secrets.TENCENT_SECRET_ID }}" \
-            -s "${{ secrets.TENCENT_SECRET_KEY }}" \
-            -b "${{ secrets.TENCENT_COS_BUCKET }}" \
-            -r "${{ secrets.TENCENT_COS_REGION }}"
+          cat > ~/.cos.conf << EOF
+          [common]
+          secret_id = ${{ secrets.TENCENT_SECRET_ID }}
+          secret_key = ${{ secrets.TENCENT_SECRET_KEY }}
+          bucket = ${{ secrets.TENCENT_COS_BUCKET }}
+          region = ${{ secrets.TENCENT_COS_REGION }}
+          part_size = 5
+          retry = 5
+          timeout = 120
+          EOF
 
       - name: Upload to COS versioned directory
         run: |
           VERSION=${{ needs.build.outputs.version }}
-          coscmd upload -s jetkvm_app "${COS_BASE_PATH}/${VERSION}/jetkvm_app" --part-size 1 -r 3
-          coscmd upload jetkvm_app.sha256 "${COS_BASE_PATH}/${VERSION}/jetkvm_app.sha256" -r 3
-          coscmd upload jetkvm_app.sig "${COS_BASE_PATH}/${VERSION}/jetkvm_app.sig" -r 3
+          coscmd upload -s jetkvm_app "${COS_BASE_PATH}/${VERSION}/jetkvm_app"
+          coscmd upload jetkvm_app.sha256 "${COS_BASE_PATH}/${VERSION}/jetkvm_app.sha256"
+          coscmd upload jetkvm_app.sig "${COS_BASE_PATH}/${VERSION}/jetkvm_app.sig"
 
       - name: Upload to COS latest directory
         run: |
           VERSION=${{ needs.build.outputs.version }}
-          coscmd upload -s jetkvm_app "${COS_BASE_PATH}/latest/jetkvm_app" --part-size 1 -r 3
-          coscmd upload jetkvm_app.sha256 "${COS_BASE_PATH}/latest/jetkvm_app.sha256" -r 3
-          coscmd upload jetkvm_app.sig "${COS_BASE_PATH}/latest/jetkvm_app.sig" -r 3
+          coscmd upload -s jetkvm_app "${COS_BASE_PATH}/latest/jetkvm_app"
+          coscmd upload jetkvm_app.sha256 "${COS_BASE_PATH}/latest/jetkvm_app.sha256"
+          coscmd upload jetkvm_app.sig "${COS_BASE_PATH}/latest/jetkvm_app.sig"
 
       - name: Build OTA metadata
         run: |
