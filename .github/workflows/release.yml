@@ -169,14 +169,14 @@ jobs:
       - name: Upload to COS versioned directory
         run: |
           VERSION=${{ needs.build.outputs.version }}
-          coscmd upload jetkvm_app "${COS_BASE_PATH}/${VERSION}/jetkvm_app"
+          coscmd upload -s jetkvm_app "${COS_BASE_PATH}/${VERSION}/jetkvm_app"
           coscmd upload jetkvm_app.sha256 "${COS_BASE_PATH}/${VERSION}/jetkvm_app.sha256"
           coscmd upload jetkvm_app.sig "${COS_BASE_PATH}/${VERSION}/jetkvm_app.sig"
 
       - name: Upload to COS latest directory
         run: |
           VERSION=${{ needs.build.outputs.version }}
-          coscmd upload jetkvm_app "${COS_BASE_PATH}/latest/jetkvm_app"
+          coscmd upload -s jetkvm_app "${COS_BASE_PATH}/latest/jetkvm_app"
           coscmd upload jetkvm_app.sha256 "${COS_BASE_PATH}/latest/jetkvm_app.sha256"
           coscmd upload jetkvm_app.sig "${COS_BASE_PATH}/latest/jetkvm_app.sig"
 
