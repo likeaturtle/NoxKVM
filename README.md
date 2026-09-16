@@ -25,7 +25,7 @@ NoxKVM 是一个高性能、开源的 KVM over IP（键盘、视频、鼠标）�
 - 自动化 GitHub Actions 发布流水线（`release.yml`）
 - 腾讯云 COS 对象存储作为固件分发 CDN
 - 通过 OTA 元数据自动触发 cos-index-repo 索引更新
-- 新增本地交叉编译工具链脚本（`setup_toolchain.sh`）和编译指南
+- 新增本地交叉编译工具链脚本（`setup_toolchain.sh`）和 [本地编译指南](本地编译指南.md)
 
 ### 代码改动
 
@@ -70,21 +70,62 @@ React + TypeScript 编写，有三个构建目标：`device`（设备端）、`d
 
 详细的编译指南请参阅 **[本地编译指南](本地编译指南.md)**。
 
-### 发布流程
+### CI/CD Workflows
 
-通过 GitHub Actions 自动化发布：
+项目包含三个独立的 GitHub Actions workflow，各有明确的职责边界：
 
-1. 手动触发 `release.yml`，输入版本号（如 `0.5.6`）
-2. 自动完成：构建 → 签名 → 创建 GitHub Release → 上传腾讯云 COS → 部署 OTA 元数据 → 触发 cos-index-repo 更新
+#### 触发条件总览
 
-所需 GitHub Secrets：
+| Workflow | push `dev`/`main` | Pull Request | push `v*` tag | 手动触发 |
+|----------|-------------------|--------------|---------------|----------|
+| `build.yml` | ✅ | ✅ | — | ✅ |
+| `lint.yml` | ✅ | ✅ | — | — |
+| `release.yml` | — | — | ✅ | ✅（需填版本号）|
 
-| Secret | 用途 |
-|---|---|
-| `GPG_PRIVATE_KEY` | GPG 签名私钥 |
-| `GPG_PASSPHRASE` | GPG 私钥密码 |
-| `TENCENT_SECRET_ID` | 腾讯云 SecretId |
-| `TENCENT_SECRET_KEY` | 腾讯云 SecretKey |
-| `TENCENT_COS_BUCKET` | COS 存储桶名称 |
-| `TENCENT_COS_REGION` | COS 区域 |
-| `COS_INDEX_PAT` | 触发 cos-index-repo 的 Personal Access Token |
+#### build.yml — 构建验证
+
+- **用途**：验证代码能否成功编译和通过测试
+- **触发**：push 到 `dev`/`main` 分支、PR、手动触发
+- **内容**：Docker 交叉编译 → 前端构建 → Go 编译 → 运行测试
+- **产出**：无制品，仅验证
+
+#### lint.yml — 代码检查
+
+- **用途**：保证代码质量和风格一致性
+- **触发**：push 到 `dev`/`main` 分支、PR
+- **内容**：Go（golangci-lint）+ UI（ESLint）
+- **产出**：无制品，仅检查
+
+#### release.yml — 发布
+
+- **用途**：构建签名版二进制、创建 GitHub Release、分发到腾讯云 COS、部署 OTA 元数据
+- **触发**：push `v*` tag 或手动指定版本号
+- **执行流程**：
+
+```
+build（构建 + GPG 签名）
+  │
+  ├─→ release（创建 GitHub Release）
+  │     │
+  │     ├─→ upload-cos（上传到腾讯云 COS）
+  │     │     │
+  │     │     └─→ update-cos-index（触发索引仓库更新）
+  │     │
+  │     └─→ deploy-pages（部署 OTA 元数据到 GitHub Pages）
+```
+
+**示例**：手动触发 `release.yml`，输入版本号 `0.5.6`，自动完成从构建到分发的全部流程。
+
+#### 所需 GitHub Secrets
+
+| Secret | 用于 Workflow | 用途 |
+|---|---|---|
+| `GPG_PRIVATE_KEY` | release | GPG 签名私钥 |
+| `GPG_PASSPHRASE` | release | GPG 私钥密码 |
+| `TENCENT_SECRET_ID` | release | 腾讯云 SecretId |
+| `TENCENT_SECRET_KEY` | release | 腾讯云 SecretKey |
+| `TENCENT_COS_BUCKET` | release | COS 存储桶名称 |
+| `TENCENT_COS_REGION` | release | COS 区域 |
+| `COS_INDEX_PAT` | release | 跨仓库触发 cos-index-repo 的 PAT |
+
+> **注意**：`cos-index-repo` 仓库需要单独配置 `TENCENT_SECRET_ID`、`TENCENT_SECRET_KEY`、`TENCENT_COS_BUCKET`、`TENCENT_COS_REGION` 四个 secret，不会从本仓库继承。
