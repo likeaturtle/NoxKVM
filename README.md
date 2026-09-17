@@ -126,6 +126,7 @@ build（构建 + GPG 签名）
 | `TENCENT_SECRET_KEY` | release | 腾讯云 SecretKey |
 | `TENCENT_COS_BUCKET` | release | COS 存储桶名称 |
 | `TENCENT_COS_REGION` | release | COS 区域 |
+| `TENCENT_COS_DOMAIN` | release | 自定义下载域名（CDN），不带协议头，如 `dl.acenova.tech`。**必填**，缺失时 workflow 直接失败 |
 | `COS_INDEX_PAT` | release | 跨仓库触发 cos-index-repo 的 PAT |
 
-> **注意**：`cos-index-repo` 仓库需要单独配置 `TENCENT_SECRET_ID`、`TENCENT_SECRET_KEY`、`TENCENT_COS_BUCKET`、`TENCENT_COS_REGION` 四个 secret，不会从本仓库继承。
+> **注意**：`cos-index-repo` 仓库需要单独配置 `TENCENT_SECRET_ID`、`TENCENT_SECRET_KEY`、`TENCENT_COS_BUCKET`、`TENCENT_COS_REGION`、`TENCENT_COS_DOMAIN` 五个 secret，不会从本仓库继承。

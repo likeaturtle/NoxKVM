@@ -189,9 +189,15 @@ jobs:
           coscmd upload jetkvm_app.sig "${COS_BASE_PATH}/latest/jetkvm_app.sig"
 
       - name: Build OTA metadata
+        env:
+          COS_DOMAIN: ${{ secrets.TENCENT_COS_DOMAIN }}
         run: |
           VERSION=${{ needs.build.outputs.version }}
-          COS_BASE="https://${{ secrets.TENCENT_COS_BUCKET }}.cos.${{ secrets.TENCENT_COS_REGION }}.myqcloud.com"
+          if [ -z "$COS_DOMAIN" ]; then
+            echo "TENCENT_COS_DOMAIN secret is required, e.g. dl.acenova.tech (no scheme)"
+            exit 1
+          fi
+          COS_BASE="https://${COS_DOMAIN}"
           HASH_VALUE=$(cat jetkvm_app.sha256 | cut -d' ' -f1)
 
           cat > releases <<EOF

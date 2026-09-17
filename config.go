@@ -21,7 +21,7 @@ import (
 
 const (
 	// DefaultAPIURL = "https://api.jetkvm.com"
-	DefaultAPIURL = "https://kvm-upgrade.tos-cn-guangzhou.volces.com/latest"
+	DefaultAPIURL = "https://dl.acenova.tech/noxkvm/app/latest"
 )
 
 type WakeOnLanDevice struct {
