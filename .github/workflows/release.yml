@@ -173,9 +173,13 @@ jobs:
           VERSION=${{ needs.build.outputs.version }}
           # 无配置文件模式：--init-skip + 凭据走命令行，密钥不落盘
           COSCLI_AUTH=(--init-skip -i "$COS_SECRET_ID" -k "$COS_SECRET_KEY" -e "cos.${COS_REGION}.myqcloud.com")
+          # 跨境链路单连接只有约 20KB/s。coscli 的 --part-size 默认 32MB，29.96MB 的产物会被切成
+          # 1 片、单线程上传，一次卡顿整轮尝试就作废；改为 1MB 分片 + 16 并发分片。
+          COSCLI_CP_OPTS=(--part-size 1 --thread-num 16 --err-retry-num 5 --err-retry-interval 5)
           for f in jetkvm_app jetkvm_app.sha256 jetkvm_app.sig; do
             # 二进制只跨境上传一次
-            coscli "${COSCLI_AUTH[@]}" cp "$f" "cos://${COS_BUCKET}/${COS_BASE_PATH}/${VERSION}/$f"
+            coscli "${COSCLI_AUTH[@]}" cp "${COSCLI_CP_OPTS[@]}" \
+              "$f" "cos://${COS_BUCKET}/${COS_BASE_PATH}/${VERSION}/$f"
             # latest/ 走桶内服务端拷贝，不产生跨境流量
             coscli "${COSCLI_AUTH[@]}" cp \
               "cos://${COS_BUCKET}/${COS_BASE_PATH}/${VERSION}/$f" \
@@ -213,7 +217,8 @@ jobs:
         run: |
           VERSION=${{ needs.build.outputs.version }}
           COSCLI_AUTH=(--init-skip -i "$COS_SECRET_ID" -k "$COS_SECRET_KEY" -e "cos.${COS_REGION}.myqcloud.com")
-          coscli "${COSCLI_AUTH[@]}" cp releases "cos://${COS_BUCKET}/${COS_BASE_PATH}/${VERSION}/releases"
+          coscli "${COSCLI_AUTH[@]}" cp --err-retry-num 5 --err-retry-interval 5 \
+            releases "cos://${COS_BUCKET}/${COS_BASE_PATH}/${VERSION}/releases"
           coscli "${COSCLI_AUTH[@]}" cp \
             "cos://${COS_BUCKET}/${COS_BASE_PATH}/${VERSION}/releases" \
             "cos://${COS_BUCKET}/${COS_BASE_PATH}/latest/releases"
