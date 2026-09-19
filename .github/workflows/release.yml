@@ -198,15 +198,35 @@ jobs:
           COS_BASE="https://${COS_DOMAIN}"
           HASH_VALUE=$(cat jetkvm_app.sha256 | cut -d' ' -f1)
 
+          # 尝试从固件仓库获取 system 元数据
+          SYS_VERSION="0.0.1"
+          SYS_URL=""
+          SYS_HASH=""
+          FW_METADATA_URL="${COS_BASE}/noxkvm/firmware/latest/metadata.json"
+          if FW_METADATA=$(curl -fsSL "$FW_METADATA_URL" 2>/dev/null); then
+            SYS_VERSION=$(echo "$FW_METADATA" | jq -r '.systemVersion // empty')
+            SYS_HASH=$(echo "$FW_METADATA" | jq -r '.systemHash // empty')
+            if [ -n "$SYS_VERSION" ] && [ -n "$SYS_HASH" ]; then
+              SYS_URL="${COS_BASE}/noxkvm/firmware/latest/update_ota.tar"
+            else
+              echo "WARNING: firmware metadata.json missing fields, skipping system update"
+              SYS_VERSION="0.0.1"
+              SYS_URL=""
+              SYS_HASH=""
+            fi
+          else
+            echo "No firmware metadata found at ${FW_METADATA_URL}, skipping system update"
+          fi
+
           cat > releases <<EOF
           {
             "appVersion": "${VERSION}",
             "appUrl": "${COS_BASE}/${COS_BASE_PATH}/latest/jetkvm_app",
             "appHash": "${HASH_VALUE}",
             "appSigUrl": "${COS_BASE}/${COS_BASE_PATH}/latest/jetkvm_app.sig",
-            "systemVersion": "0.0.1",
-            "systemUrl": "",
-            "systemHash": ""
+            "systemVersion": "${SYS_VERSION}",
+            "systemUrl": "${SYS_URL}",
+            "systemHash": "${SYS_HASH}"
           }
           EOF
 
