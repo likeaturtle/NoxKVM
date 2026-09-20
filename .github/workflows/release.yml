@@ -15,7 +15,38 @@ permissions:
   contents: write
 
 jobs:
+  check-secrets:
+    runs-on: ubuntu-latest
+    name: Validate Secrets
+    steps:
+      - name: Check required secrets
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          TENCENT_COS_BUCKET: ${{ secrets.TENCENT_COS_BUCKET }}
+          TENCENT_COS_REGION: ${{ secrets.TENCENT_COS_REGION }}
+          TENCENT_SECRET_ID: ${{ secrets.TENCENT_SECRET_ID }}
+          TENCENT_SECRET_KEY: ${{ secrets.TENCENT_SECRET_KEY }}
+          TENCENT_COS_DOMAIN: ${{ secrets.TENCENT_COS_DOMAIN }}
+          COS_INDEX_PAT: ${{ secrets.COS_INDEX_PAT }}
+        run: |
+          MISSING=()
+          [ -z "$GPG_PRIVATE_KEY" ]     && MISSING+=("GPG_PRIVATE_KEY")
+          [ -z "$GPG_PASSPHRASE" ]      && MISSING+=("GPG_PASSPHRASE")
+          [ -z "$TENCENT_COS_BUCKET" ]  && MISSING+=("TENCENT_COS_BUCKET")
+          [ -z "$TENCENT_COS_REGION" ]  && MISSING+=("TENCENT_COS_REGION")
+          [ -z "$TENCENT_SECRET_ID" ]   && MISSING+=("TENCENT_SECRET_ID")
+          [ -z "$TENCENT_SECRET_KEY" ]  && MISSING+=("TENCENT_SECRET_KEY")
+          [ -z "$TENCENT_COS_DOMAIN" ]  && MISSING+=("TENCENT_COS_DOMAIN")
+          [ -z "$COS_INDEX_PAT" ]       && MISSING+=("COS_INDEX_PAT")
+          if [ ${#MISSING[@]} -gt 0 ]; then
+            echo "::error::Missing required secrets: ${MISSING[*]}"
+            exit 1
+          fi
+          echo "All secrets present."
+
   build:
+    needs: check-secrets
     runs-on: ubuntu-latest
     name: Build Release
     outputs:
