@@ -417,8 +417,33 @@ type SSHKeyState struct {
 
 // rpcGetDeviceCapabilities lists the optional features this firmware supports.
 // The UI hides the controls for a capability the device does not report.
+// video_during_update: the video stream keeps running while an update
+// downloads and installs; a device without it pauses video for the
+// duration and the UI says so over the video.
+// http_proxy, domain, mdns, ipv6: the network settings of the same names can
+// be changed; the Network page hides those a device does not report.
+// tls, local_loopback, log_level, tailscale: the HTTPS setting (Access page),
+// the loopback-only setting and the default log level (Advanced page) and the
+// Tailscale card (Network page), each shown only when reported.
 func rpcGetDeviceCapabilities() ([]string, error) {
-	return []string{"shell", "extensions", "usb_serial", "custom_edid", "upload_channel"}, nil
+	return []string{
+		"shell", "extensions", "usb_serial", "custom_edid", "upload_channel", "video_during_update",
+		"http_proxy", "domain", "mdns", "ipv6",
+		"tls", "local_loopback", "log_level", "tailscale",
+	}, nil
+}
+
+// reportLocalVersionAndCapabilities sends the device's version and
+// capabilities to a session whose RPC channel just opened. They do not change
+// while the session runs; the UI waits for these events instead of asking.
+func reportLocalVersionAndCapabilities(session *Session) {
+	if version, err := rpcGetLocalVersion(); err != nil {
+		jsonRpcLogger.Warn().Err(err).Msg("failed to read the local version for the localVersion event")
+	} else {
+		writeJSONRPCEvent("localVersion", version, session)
+	}
+	capabilities, _ := rpcGetDeviceCapabilities()
+	writeJSONRPCEvent("deviceCapabilities", capabilities, session)
 }
 
 // videoPausedBy is the session whose UI asked for the video stream to stop,
@@ -814,6 +839,12 @@ var factoryResetPaths = []string{
 
 func rpcFactoryReset() error {
 	logger.Info().Msg("Factory reset initiated, removing all user data")
+
+	if config.CloudToken != "" && config.CloudURL != "" {
+		if err := rpcDeregisterDevice(); err != nil {
+			logger.Warn().Err(err).Msg("failed to deregister device from cloud during factory reset")
+		}
+	}
 
 	var errs []error
 	for _, path := range factoryResetPaths {

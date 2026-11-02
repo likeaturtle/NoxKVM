@@ -37,9 +37,16 @@ import {
   useCapability,
   useDeviceStore,
 } from "@hooks/stores";
-import { JsonRpcRequest, JsonRpcResponse, RpcMethodNotFound, useJsonRpc } from "@hooks/useJsonRpc";
+import {
+  holdRpcEvents,
+  JsonRpcRequest,
+  JsonRpcResponse,
+  RpcMethodNotFound,
+  useJsonRpc,
+} from "@hooks/useJsonRpc";
 import { useDeviceUiNavigation } from "@hooks/useAppNavigation";
-import { useVersion } from "@hooks/useVersion";
+import type { VersionInfo as LocalVersion } from "@hooks/useVersion";
+import { useHiddenVideoStreamPause } from "@hooks/useHiddenVideoStreamPause";
 import WebRTCVideo from "@components/WebRTCVideo";
 import DashboardNavbar from "@components/Header";
 const ConnectionStatsSidebar = lazy(() => import("@components/sidebar/connectionStats"));
@@ -110,6 +117,8 @@ const loader: LoaderFunction = ({ params }: LoaderFunctionArgs) => {
 
 export default function KvmIdRoute() {
   const setCapabilities = useDeviceStore(state => state.setCapabilities);
+  const setAppVersion = useDeviceStore(state => state.setAppVersion);
+  const setSystemVersion = useDeviceStore(state => state.setSystemVersion);
   const loaderResp = useLoaderData();
   // Depending on the mode, we set the appropriate variables
   const user = "user" in loaderResp ? loaderResp.user : null;
@@ -118,6 +127,7 @@ export default function KvmIdRoute() {
   const authMode = "authMode" in loaderResp ? loaderResp.authMode : null;
 
   const params = useParams() as { id: string };
+  useHiddenVideoStreamPause();
   const {
     sidebarView,
     setSidebarView,
@@ -196,6 +206,7 @@ export default function KvmIdRoute() {
       pc.addTransceiver("audio", { direction: "recvonly" });
 
       const rpcDataChannel = pc.createDataChannel("rpc");
+      holdRpcEvents(rpcDataChannel);
       rpcDataChannel.onclose = () => {
         console.log("rpcDataChannel has closed");
         setRpcDataChannel(null);
@@ -292,7 +303,7 @@ export default function KvmIdRoute() {
       setRpcHidUnreliableNonOrderedChannel(null);
       setRpcHidProtocolVersion(null);
       setTerminalChannel(null);
-      setCapabilities([]);
+      setCapabilities(null);
     };
   }, [
     clearCandidatePairStats,
@@ -461,17 +472,27 @@ export default function KvmIdRoute() {
       console.debug("Setting failsafe mode", { active, reason });
       setFailsafeMode(active, reason);
     }
+
+    // The device sends its version and capabilities each time the RPC
+    // channel opens.
+    if (resp.method === "localVersion") {
+      const { appVersion, systemVersion } = resp.params as LocalVersion;
+      setAppVersion(appVersion ?? "");
+      setSystemVersion(systemVersion);
+    }
+
+    if (resp.method === "deviceCapabilities") {
+      setCapabilities(resp.params as unknown as string[]);
+    }
   }
 
-  const { send } = useJsonRpc(onJsonRpcRequest);
+  const { send } = useJsonRpc(onJsonRpcRequest, { receiveHeldEvents: true });
 
   useEffect(() => {
-    if (rpcDataChannel?.readyState !== "open") return;
-    send("getDeviceCapabilities", {}, (resp: JsonRpcResponse) => {
-      if ("error" in resp) return;
-      setCapabilities(resp.result as string[]);
-    });
-  }, [rpcDataChannel?.readyState, send, setCapabilities]);
+    // A new or closed channel may lead to different firmware: gated features
+    // stay hidden until this channel's deviceCapabilities event arrives.
+    if (rpcDataChannel?.readyState !== "open") setCapabilities(null);
+  }, [rpcDataChannel?.readyState, setCapabilities]);
 
   // Mouse movement handler for E2E tests (needs send from useJsonRpc)
   const handleAbsMouseMove = useCallback(
@@ -637,14 +658,6 @@ export default function KvmIdRoute() {
       setDisableVideoFocusTrap(true);
     }
   }, [navigateTo, location.pathname, setDisableVideoFocusTrap]);
-
-  const { appVersion, getLocalVersion } = useVersion();
-
-  useEffect(() => {
-    if (appVersion) return;
-
-    getLocalVersion();
-  }, [appVersion, getLocalVersion]);
 
   const { isFailsafeMode, reason: failsafeReason } = useFailsafeModeStore();
 
